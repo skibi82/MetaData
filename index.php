@@ -204,6 +204,415 @@ function summarizeCertificate(string $certificate): ?array
     ];
 }
 
+function readDerElement(string $data, int &$offset): ?array
+{
+    $dataLength = strlen($data);
+    if ($offset + 2 > $dataLength) {
+        return null;
+    }
+    $start = $offset;
+    $tag = ord($data[$offset++]);
+    $lengthByte = ord($data[$offset++]);
+    if (($tag & 0x1f) === 0x1f) {
+        return null;
+    }
+    if (($lengthByte & 0x80) === 0) {
+        $length = $lengthByte;
+    } else {
+        $lengthBytes = $lengthByte & 0x7f;
+        if ($lengthBytes === 0 || $lengthBytes > 4 || $offset + $lengthBytes > $dataLength) {
+            return null;
+        }
+        $length = 0;
+        for ($index = 0; $index < $lengthBytes; $index++) {
+            $length = ($length * 256) + ord($data[$offset++]);
+        }
+    }
+    if ($length > $dataLength - $offset) {
+        return null;
+    }
+    $contentOffset = $offset;
+    $offset += $length;
+    return [
+        'tag' => $tag,
+        'start' => $start,
+        'content' => $contentOffset,
+        'length' => $length,
+        'end' => $offset,
+    ];
+}
+
+function derChildren(string $data, array $element): ?array
+{
+    $offset = $element['content'];
+    $children = [];
+    while ($offset < $element['end']) {
+        $child = readDerElement($data, $offset);
+        if ($child === null || $child['end'] > $element['end']) {
+            return null;
+        }
+        $children[] = $child;
+    }
+    return $offset === $element['end'] ? $children : null;
+}
+
+function derObjectIdentifier(string $data, array $element): ?string
+{
+    if ($element['tag'] !== 0x06 || $element['length'] === 0) {
+        return null;
+    }
+    $bytes = array_values(unpack('C*', substr($data, $element['content'], $element['length'])));
+    $arcs = [];
+    $value = 0;
+    foreach ($bytes as $byte) {
+        $value = ($value * 128) + ($byte & 0x7f);
+        if (($byte & 0x80) === 0) {
+            if ($arcs === []) {
+                $firstArc = min(2, intdiv($value, 40));
+                $arcs[] = $firstArc;
+                $arcs[] = $value - ($firstArc * 40);
+            } else {
+                $arcs[] = $value;
+            }
+            $value = 0;
+        }
+    }
+    return $value === 0 ? implode('.', $arcs) : null;
+}
+
+function certificateDer(string $certificate): ?string
+{
+    if (preg_match('~-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----~s', $certificate, $match)) {
+        $der = base64_decode(preg_replace('/\s+/', '', $match[1]), true);
+        return is_string($der) ? $der : null;
+    }
+    return isset($certificate[0]) && ord($certificate[0]) === 0x30 ? $certificate : null;
+}
+
+function certificateNameDer(string $certificate, string $name): ?string
+{
+    $der = certificateDer($certificate);
+    if (!is_string($der)) {
+        return null;
+    }
+    $offset = 0;
+    $certificateElement = readDerElement($der, $offset);
+    $certificateFields = $certificateElement !== null ? derChildren($der, $certificateElement) : null;
+    $tbs = is_array($certificateFields) ? ($certificateFields[0] ?? null) : null;
+    $tbsFields = is_array($tbs) ? derChildren($der, $tbs) : null;
+    if (!is_array($tbsFields)) {
+        return null;
+    }
+    $indexOffset = ($tbsFields[0]['tag'] ?? null) === 0xa0 ? 1 : 0;
+    $nameIndex = $indexOffset + ($name === 'issuer' ? 2 : 4);
+    $nameElement = $tbsFields[$nameIndex] ?? null;
+    if (!is_array($nameElement) || $nameElement['tag'] !== 0x30) {
+        return null;
+    }
+    return substr($der, $nameElement['start'], $nameElement['end'] - $nameElement['start']);
+}
+
+function fetchValidationResource(string $url): ?string
+{
+    static $cache = [];
+    if (array_key_exists($url, $cache)) {
+        return $cache[$url] ?: null;
+    }
+    if (!function_exists('curl_init') || strlen($url) > 2048) {
+        $cache[$url] = false;
+        return null;
+    }
+    $parts = parse_url($url);
+    if (!is_array($parts)
+        || !in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true)
+        || !isset($parts['host'])
+        || isset($parts['user'])
+        || isset($parts['pass'])) {
+        $cache[$url] = false;
+        return null;
+    }
+    $scheme = strtolower($parts['scheme']);
+    $host = strtolower(rtrim($parts['host'], '.'));
+    $port = (int) ($parts['port'] ?? ($scheme === 'https' ? 443 : 80));
+    if ($host === '' || $port !== ($scheme === 'https' ? 443 : 80)) {
+        $cache[$url] = false;
+        return null;
+    }
+    $hostIsIp = filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    $addresses = $hostIsIp
+        ? [$host]
+        : (gethostbynamel($host) ?: []);
+    if ($addresses === []) {
+        $cache[$url] = false;
+        return null;
+    }
+    foreach ($addresses as $address) {
+        if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            $cache[$url] = false;
+            return null;
+        }
+    }
+
+    $body = '';
+    $maxBytes = 8 * 1024 * 1024;
+    $curl = curl_init($url);
+    curl_setopt_array($curl, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_PROXY => '',
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_TIMEOUT => 10,
+        CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$body, $maxBytes): int {
+            if (strlen($body) + strlen($chunk) > $maxBytes) {
+                return 0;
+            }
+            $body .= $chunk;
+            return strlen($chunk);
+        },
+    ]);
+    if (!$hostIsIp) {
+        curl_setopt($curl, CURLOPT_RESOLVE, [$host . ':' . $port . ':' . $addresses[0]]);
+    }
+    $success = curl_exec($curl) !== false && curl_getinfo($curl, CURLINFO_RESPONSE_CODE) === 200;
+    $cache[$url] = $success ? $body : false;
+    return $success ? $body : null;
+}
+
+function findCertificateIssuer(string $certificate, array $embeddedCertificates): ?string
+{
+    $issuerName = certificateNameDer($certificate, 'issuer');
+    if (!is_string($issuerName)) {
+        return null;
+    }
+    foreach ($embeddedCertificates as $candidate) {
+        if (certificateNameDer($candidate, 'subject') === $issuerName
+            && @openssl_x509_verify($certificate, $candidate) === 1) {
+            return $candidate;
+        }
+    }
+    $parsed = @openssl_x509_parse($certificate);
+    $authorityInfo = is_array($parsed) ? (string) ($parsed['extensions']['authorityInfoAccess'] ?? '') : '';
+    if (preg_match_all('~CA Issuers\s*-\s*URI:(https?://[^\s,]+)~i', $authorityInfo, $matches)) {
+        foreach (array_slice(array_unique($matches[1]), 0, 4) as $url) {
+            $data = fetchValidationResource(rtrim($url, '.,;'));
+            if (!is_string($data)) {
+                continue;
+            }
+            if (!str_starts_with($data, '-----BEGIN CERTIFICATE-----')) {
+                if (!isset($data[0]) || ord($data[0]) !== 0x30) {
+                    continue;
+                }
+                $data = "-----BEGIN CERTIFICATE-----\n" . chunk_split(base64_encode($data), 64, "\n") . "-----END CERTIFICATE-----\n";
+            }
+            if (certificateNameDer($data, 'subject') === $issuerName
+                && @openssl_x509_verify($certificate, $data) === 1) {
+                return $data;
+            }
+        }
+    }
+    return null;
+}
+
+function parseAsn1Time(string $data, array $element): ?int
+{
+    $value = substr($data, $element['content'], $element['length']);
+    if ($element['tag'] === 0x17 && preg_match('/^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/', $value, $match)) {
+        $year = (int) $match[1];
+        $year += $year >= 50 ? 1900 : 2000;
+        $value = sprintf('%04d%s%s%s%s%s', $year, $match[2], $match[3], $match[4], $match[5], $match[6]);
+        $format = '!YmdHis';
+    } elseif ($element['tag'] === 0x18 && preg_match('/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/', $value, $match)) {
+        $value = implode('', array_slice($match, 1));
+        $format = '!YmdHis';
+    } else {
+        return null;
+    }
+    $date = DateTimeImmutable::createFromFormat($format, $value, new DateTimeZone('UTC'));
+    return $date instanceof DateTimeImmutable ? $date->getTimestamp() : null;
+}
+
+function verifyCertificateCrl(string $certificate, string $issuerCertificate, string $crlData): ?array
+{
+    if (preg_match('~-----BEGIN X509 CRL-----(.*?)-----END X509 CRL-----~s', $crlData, $match)) {
+        $crlData = base64_decode(preg_replace('/\s+/', '', $match[1]), true) ?: '';
+    }
+    $crlIssuer = certificateNameDer($issuerCertificate, 'subject');
+    if ($crlIssuer === null
+        || certificateNameDer($certificate, 'issuer') !== $crlIssuer
+        || @openssl_x509_verify($certificate, $issuerCertificate) !== 1) {
+        return null;
+    }
+    $parsedIssuer = @openssl_x509_parse($issuerCertificate);
+    $issuerExtensions = is_array($parsedIssuer) ? ($parsedIssuer['extensions'] ?? []) : [];
+    $keyUsage = (string) ($issuerExtensions['keyUsage'] ?? '');
+    $basicConstraints = (string) ($issuerExtensions['basicConstraints'] ?? '');
+    if (($keyUsage !== '' && stripos($keyUsage, 'CRL Sign') === false)
+        || ($basicConstraints !== '' && preg_match('/CA:\s*TRUE/i', $basicConstraints) !== 1)) {
+        return null;
+    }
+    $offset = 0;
+    $crl = readDerElement($crlData, $offset);
+    $crlFields = $crl !== null && $crl['tag'] === 0x30 && $crl['end'] === strlen($crlData)
+        ? derChildren($crlData, $crl)
+        : null;
+    if (!is_array($crlFields) || count($crlFields) !== 3
+        || $crlFields[0]['tag'] !== 0x30
+        || $crlFields[1]['tag'] !== 0x30
+        || $crlFields[2]['tag'] !== 0x03) {
+        return null;
+    }
+    $tbsFields = derChildren($crlData, $crlFields[0]);
+    $outerAlgorithm = derChildren($crlData, $crlFields[1]);
+    if (!is_array($tbsFields) || !is_array($outerAlgorithm) || $outerAlgorithm === []) {
+        return null;
+    }
+    $index = ($tbsFields[0]['tag'] ?? null) === 0x02 ? 1 : 0;
+    $innerAlgorithm = $tbsFields[$index] ?? null;
+    $issuerName = $tbsFields[$index + 1] ?? null;
+    $thisUpdate = $tbsFields[$index + 2] ?? null;
+    if (!is_array($innerAlgorithm) || !is_array($issuerName) || !is_array($thisUpdate)
+        || $issuerName['tag'] !== 0x30
+        || !hash_equals($crlIssuer, substr($crlData, $issuerName['start'], $issuerName['end'] - $issuerName['start']))) {
+        return null;
+    }
+    $innerAlgorithmFields = derChildren($crlData, $innerAlgorithm);
+    $algorithmOid = derObjectIdentifier($crlData, $outerAlgorithm[0]);
+    if (!is_array($innerAlgorithmFields) || $algorithmOid === null
+        || derObjectIdentifier($crlData, $innerAlgorithmFields[0]) !== $algorithmOid) {
+        return null;
+    }
+    $signatureAlgorithm = match ($algorithmOid) {
+        '1.2.840.113549.1.1.5', '1.2.840.10045.4.1', '1.2.840.10040.4.3' => OPENSSL_ALGO_SHA1,
+        '1.2.840.113549.1.1.11', '1.2.840.10045.4.3.2', '2.16.840.1.101.3.4.3.2' => OPENSSL_ALGO_SHA256,
+        '1.2.840.113549.1.1.12', '1.2.840.10045.4.3.3' => OPENSSL_ALGO_SHA384,
+        '1.2.840.113549.1.1.13', '1.2.840.10045.4.3.4' => OPENSSL_ALGO_SHA512,
+        default => null,
+    };
+    $signatureBits = $crlFields[2];
+    if ($signatureAlgorithm === null || $signatureBits['length'] < 2
+        || ord($crlData[$signatureBits['content']]) !== 0) {
+        return null;
+    }
+    $crlExtensions = [];
+    for ($fieldIndex = $index + 3; $fieldIndex < count($tbsFields); $fieldIndex++) {
+        if ($tbsFields[$fieldIndex]['tag'] === 0xa0) {
+            $explicit = derChildren($crlData, $tbsFields[$fieldIndex]);
+            $crlExtensions = is_array($explicit) && isset($explicit[0]) ? derChildren($crlData, $explicit[0]) ?? [] : [];
+            break;
+        }
+    }
+    foreach ($crlExtensions as $extension) {
+        $fields = derChildren($crlData, $extension);
+        $oid = is_array($fields) && isset($fields[0]) ? derObjectIdentifier($crlData, $fields[0]) : null;
+        if (in_array($oid, ['2.5.29.27', '2.5.29.28'], true)) {
+            return null;
+        }
+        if (($fields[1]['tag'] ?? null) === 0x01
+            && substr($crlData, $fields[1]['content'], $fields[1]['length']) !== "\0") {
+            return null;
+        }
+    }
+    $nextUpdate = null;
+    $revokedCertificates = null;
+    for ($fieldIndex = $index + 3; $fieldIndex < count($tbsFields); $fieldIndex++) {
+        $field = $tbsFields[$fieldIndex];
+        if (in_array($field['tag'], [0x17, 0x18], true) && $nextUpdate === null) {
+            $nextUpdate = parseAsn1Time($crlData, $field);
+        } elseif ($field['tag'] === 0x30) {
+            $entries = derChildren($crlData, $field);
+            if (is_array($entries) && isset($entries[0]) && $entries[0]['tag'] === 0x30) {
+                $firstEntry = derChildren($crlData, $entries[0]);
+                if (is_array($firstEntry) && ($firstEntry[0]['tag'] ?? null) === 0x02) {
+                    $revokedCertificates = $entries;
+                }
+            }
+        }
+    }
+    $thisTimestamp = parseAsn1Time($crlData, $thisUpdate);
+    if ($thisTimestamp === null || $nextUpdate === null
+        || $thisTimestamp > time() + 300 || $nextUpdate < time()) {
+        return null;
+    }
+    $tbsBytes = substr($crlData, $crlFields[0]['start'], $crlFields[0]['end'] - $crlFields[0]['start']);
+    $signature = substr($crlData, $signatureBits['content'] + 1, $signatureBits['length'] - 1);
+    if (@openssl_verify($tbsBytes, $signature, $issuerCertificate, $signatureAlgorithm) !== 1) {
+        return null;
+    }
+    $parsedCertificate = @openssl_x509_parse($certificate);
+    $serialNumber = (string) ($parsedCertificate['serialNumberHex'] ?? '');
+    if ($serialNumber === '') {
+        return null;
+    }
+    $serial = strtoupper(ltrim($serialNumber, '0')) ?: '0';
+    foreach ($revokedCertificates ?? [] as $entry) {
+        $entryFields = derChildren($crlData, $entry);
+        if (!is_array($entryFields) || ($entryFields[0]['tag'] ?? null) !== 0x02) {
+            return null;
+        }
+        if (($entryFields[2]['tag'] ?? null) === 0x30) {
+            foreach (derChildren($crlData, $entryFields[2]) ?? [] as $extension) {
+                $fields = derChildren($crlData, $extension);
+                $oid = is_array($fields) && isset($fields[0]) ? derObjectIdentifier($crlData, $fields[0]) : null;
+                if ($oid === '2.5.29.29'
+                    || (($fields[1]['tag'] ?? null) === 0x01
+                        && substr($crlData, $fields[1]['content'], $fields[1]['length']) !== "\0")) {
+                    return null;
+                }
+            }
+        }
+        $entrySerial = strtoupper(ltrim(bin2hex(substr($crlData, $entryFields[0]['content'], $entryFields[0]['length'])), '0')) ?: '0';
+        if ($entrySerial === $serial) {
+            $revokedAt = isset($entryFields[1]) ? parseAsn1Time($crlData, $entryFields[1]) : null;
+            return $revokedAt !== null && $revokedAt > time()
+                ? ['status' => 'good', 'message' => 'Nie figuruje na aktualnej liście CRL.', 'source' => '']
+                : ['status' => 'revoked', 'message' => 'Certyfikat znajduje się na aktualnej liście CRL.', 'source' => ''];
+        }
+    }
+    return ['status' => 'good', 'message' => 'Nie figuruje na aktualnej, poprawnie podpisanej liście CRL.', 'source' => ''];
+}
+
+function certificateRevocationStatus(string $certificate, array $embeddedCertificates): array
+{
+    $parsed = @openssl_x509_parse($certificate);
+    $distributionPoints = is_array($parsed) ? (string) ($parsed['extensions']['crlDistributionPoints'] ?? '') : '';
+    if (!preg_match_all('~URI:(https?://[^\s,]+)~i', $distributionPoints, $matches)) {
+        return ['status' => 'unknown', 'message' => 'Certyfikat nie zawiera adresu CRL.', 'source' => ''];
+    }
+    $issuerCertificate = findCertificateIssuer($certificate, $embeddedCertificates);
+    if (!is_string($issuerCertificate)) {
+        return ['status' => 'unknown', 'message' => 'Nie udało się zweryfikować certyfikatu wystawcy.', 'source' => ''];
+    }
+    $lastSource = '';
+    $goodStatus = null;
+    foreach (array_slice(array_unique(array_map(static fn (string $url): string => rtrim($url, '.,;'), $matches[1])), 0, 4) as $url) {
+        $lastSource = $url;
+        $crlData = fetchValidationResource($url);
+        if (!is_string($crlData)) {
+            continue;
+        }
+        $status = verifyCertificateCrl($certificate, $issuerCertificate, $crlData);
+        if (is_array($status)) {
+            $status['source'] = $url;
+            if ($status['status'] === 'revoked') {
+                return $status;
+            }
+            $goodStatus ??= $status;
+        }
+    }
+    if (is_array($goodStatus)) {
+        return $goodStatus;
+    }
+    return [
+        'status' => 'unknown',
+        'message' => 'Nie udało się pobrać lub zweryfikować aktualnej listy CRL.',
+        'source' => $lastSource,
+    ];
+}
+
 function verifyPdfSignatures(string $contents): array
 {
     preg_match_all('~/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]~', $contents, $ranges, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
@@ -258,6 +667,7 @@ function verifyPdfSignatures(string $contents): array
                 foreach ($certificatePems as $certificatePem) {
                     $summary = summarizeCertificate($certificatePem);
                     if ($summary !== null) {
+                        $summary['revocation'] = certificateRevocationStatus($certificatePem, $certificatePems);
                         $certificates[] = $summary;
                     }
                 }
@@ -567,12 +977,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                                     <div><dt>Wystawca</dt><dd><?= escape($certificate['issuer']) ?></dd></div>
                                                     <div><dt>Ważność</dt><dd><?= escape($certificate['valid_from']) ?> – <?= escape($certificate['valid_to']) ?> · <?= $certificate['currently_valid'] ? 'ważny obecnie' : 'poza okresem ważności' ?></dd></div>
                                                     <div><dt>Zaufanie</dt><dd><?= $certificate['trusted'] ? 'łańcuch zaufany przez lokalny OpenSSL' : 'łańcuch niezaufany lub niezweryfikowany' ?></dd></div>
+                                                    <div><dt>Status CRL</dt><dd><?= escape($certificate['revocation']['message']) ?><?php if ($certificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($certificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło CRL</a><?php endif; ?></dd></div>
                                                     <div><dt>SHA-256</dt><dd><?= escape($certificate['fingerprint']) ?></dd></div>
                                                 </dl>
                                             <?php endforeach; ?>
                                         </div>
                                     <?php endforeach; ?>
-                                    <?php if ($result['signatures']['status'] !== 'none'): ?><p class="signature-caveat">Zaufanie jest sprawdzane względem lokalnego magazynu CA. Aplikacja nie sprawdza unieważnienia certyfikatu (CRL/OCSP).</p><?php endif; ?>
+                                    <?php if ($result['signatures']['status'] !== 'none'): ?><p class="signature-caveat">Zaufanie jest sprawdzane względem lokalnego magazynu CA. Status CRL jest pobierany z adresu podanego w certyfikacie; OCSP nie jest obsługiwane.</p><?php endif; ?>
                                 </div>
                             <?php endif; ?>
                         </article>
