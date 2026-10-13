@@ -217,12 +217,6 @@ function verifyPdfSignatures(string $contents): array
     $items = [];
     foreach ($ranges as $rangeMatch) {
         $range = array_map('intval', array_column(array_slice($rangeMatch, 1), 0));
-        $rangeOffset = $rangeMatch[0][1];
-        $rangeStart = strrpos(substr($contents, 0, $rangeOffset), '<<');
-        $rangeEnd = strpos($contents, '>>', $rangeOffset + strlen($rangeMatch[0][0]));
-        $dictionary = $rangeStart !== false && $rangeEnd !== false
-            ? substr($contents, $rangeStart, $rangeEnd - $rangeStart + 2)
-            : '';
         $signatureContent = [];
         $validRange = count($range) === 4
             && $range[0] === 0
@@ -231,15 +225,18 @@ function verifyPdfSignatures(string $contents): array
             && $range[3] >= 0
             && $range[2] + $range[3] <= strlen($contents);
 
-        if ($dictionary === '' || !preg_match('~/Contents\s*<([\da-fA-F\s]+)>~', $dictionary, $signatureContent, PREG_OFFSET_CAPTURE)) {
+        if ($validRange) {
+            $gap = substr($contents, $range[1], $range[2] - $range[1]);
+            if (!preg_match('~^\s*<([\da-fA-F\s]+)>\s*$~s', $gap, $signatureContent, PREG_OFFSET_CAPTURE)) {
+                $validRange = false;
+            }
+        }
+        if (!$validRange || $signatureContent === []) {
             $validRange = false;
         }
         $cms = '';
         if ($signatureContent !== []) {
             $contentsMatch = $signatureContent[0][0];
-            $contentsOffset = $rangeStart + $signatureContent[0][1];
-            $signatureStart = $contentsOffset + strpos($contentsMatch, '<');
-            $signatureEnd = $contentsOffset + strlen($contentsMatch);
             $hex = preg_replace('/\s+/', '', $signatureContent[1][0]);
             $decoded = $hex !== '' ? @hex2bin($hex) : false;
             $derLength = is_string($decoded) ? cmsDerLength($decoded) : 0;
@@ -248,15 +245,6 @@ function verifyPdfSignatures(string $contents): array
             } else {
                 $validRange = false;
             }
-        } else {
-            $validRange = false;
-        }
-        if ($validRange && $cms !== '') {
-            $gap = substr($contents, $range[1], $range[2] - $range[1]);
-            $signatureToken = substr($contents, $signatureStart, $signatureEnd - $signatureStart);
-            $validRange = $range[1] <= $signatureStart
-                && $range[2] >= $signatureEnd
-                && trim(str_replace($signatureToken, '', $gap)) === '';
         } else {
             $validRange = false;
         }
@@ -319,6 +307,43 @@ function verifyPdfSignatures(string $contents): array
     ];
 }
 
+function expandPdfObjectStreams(string $contents): string
+{
+    $expanded = '';
+    $offset = 0;
+    while (($objectStreamOffset = strpos($contents, '/ObjStm', $offset)) !== false) {
+        $streamOffset = strpos($contents, 'stream', $objectStreamOffset);
+        if ($streamOffset === false) {
+            break;
+        }
+        $streamStart = $streamOffset + strlen('stream');
+        if (substr($contents, $streamStart, 2) === "\r\n") {
+            $streamStart += 2;
+        } elseif (substr($contents, $streamStart, 1) === "\n" || substr($contents, $streamStart, 1) === "\r") {
+            $streamStart++;
+        }
+        $streamEnd = strpos($contents, 'endstream', $streamStart);
+        if ($streamEnd === false) {
+            break;
+        }
+        $dictionaryStart = strrpos(substr($contents, 0, $objectStreamOffset), '<<');
+        $dictionary = $dictionaryStart !== false
+            ? substr($contents, $dictionaryStart, $streamOffset - $dictionaryStart)
+            : '';
+        $compressed = rtrim(substr($contents, $streamStart, $streamEnd - $streamStart), "\r\n");
+        if (preg_match('~/Filter\s*(?:\[\s*)?/FlateDecode\b~', $dictionary)) {
+            $stream = @gzuncompress($compressed);
+        } else {
+            $stream = $compressed;
+        }
+        if (is_string($stream)) {
+            $expanded .= "\n" . $stream;
+        }
+        $offset = $streamEnd + strlen('endstream');
+    }
+    return $expanded === '' ? $contents : $contents . $expanded;
+}
+
 function extractPdfMetadata(string $path): array
 {
     $contents = file_get_contents($path);
@@ -331,9 +356,10 @@ function extractPdfMetadata(string $path): array
         'Keywords' => 'keywords', 'Creator' => 'software', 'Producer' => 'producer',
         'CreationDate' => 'created', 'ModDate' => 'modified',
     ];
+    $searchableContents = expandPdfObjectStreams($contents);
     foreach ($properties as $property => $key) {
         $pattern = '~/' . preg_quote($property, '~') . '\s*(\((?:\\\\.|[^\\\\)])*\)|<[\da-fA-F\s]+>)~s';
-        if (preg_match($pattern, $contents, $match)) {
+        if (preg_match($pattern, $searchableContents, $match)) {
             addMetadata($metadata, $key, decodePdfString($match[1]));
         }
     }
