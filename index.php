@@ -11,6 +11,7 @@ $labels = [
     'subject' => 'Temat', 'keywords' => 'Słowa kluczowe',
     'description' => 'Opis', 'created' => 'Data utworzenia',
     'modified' => 'Data modyfikacji', 'last_modified_by' => 'Ostatnio zmodyfikował',
+    'editing_time' => 'Łączny czas edycji',
     'software' => 'Program', 'producer' => 'Producent', 'manager' => 'Osoba kontaktowa',
     'copyright' => 'Prawa autorskie', 'camera' => 'Aparat',
 ];
@@ -45,6 +46,27 @@ function xmlProperty(SimpleXMLElement $xml, string $name): string
     return $nodes ? trim((string) $nodes[0]) : '';
 }
 
+function formatEditingTime(string $value): string
+{
+    if (!ctype_digit($value)) {
+        return $value;
+    }
+    $minutes = filter_var($value, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+    if ($minutes === false) {
+        return $value . ' min';
+    }
+    $hours = intdiv($minutes, 60);
+    $remainingMinutes = $minutes % 60;
+    if ($hours === 0) {
+        return $minutes . ' min';
+    }
+    $duration = $hours . ' godz.';
+    if ($remainingMinutes > 0) {
+        $duration .= ' ' . $remainingMinutes . ' min';
+    }
+    return $duration . ' (' . $minutes . ' min)';
+}
+
 function extractOfficeMetadata(string $path): array
 {
     if (!class_exists(ZipArchive::class)) {
@@ -62,7 +84,10 @@ function extractOfficeMetadata(string $path): array
             'title' => 'title', 'subject' => 'subject', 'keywords' => 'keywords',
             'description' => 'description', 'created' => 'created', 'modified' => 'modified',
         ],
-        'docProps/app.xml' => ['Company' => 'company', 'Manager' => 'manager', 'Application' => 'software'],
+        'docProps/app.xml' => [
+            'Company' => 'company', 'Manager' => 'manager', 'Application' => 'software',
+            'TotalTime' => 'editing_time',
+        ],
     ];
     foreach ($parts as $entry => $properties) {
         $contents = $archive->getFromName($entry);
@@ -74,7 +99,11 @@ function extractOfficeMetadata(string $path): array
             continue;
         }
         foreach ($properties as $property => $key) {
-            addMetadata($metadata, $key, xmlProperty($xml, $property));
+            $value = xmlProperty($xml, $property);
+            if ($key === 'editing_time') {
+                $value = formatEditingTime($value);
+            }
+            addMetadata($metadata, $key, $value);
         }
     }
     $signatureFound = false;
