@@ -235,28 +235,51 @@ function verifyPdfSignatures(string $contents): array
             $validRange = false;
         }
         $cms = '';
-        if ($validRange) {
+        if ($signatureContent !== []) {
             $contentsMatch = $signatureContent[0][0];
             $contentsOffset = $rangeStart + $signatureContent[0][1];
             $signatureStart = $contentsOffset + strpos($contentsMatch, '<');
             $signatureEnd = $contentsOffset + strlen($contentsMatch);
+            $hex = preg_replace('/\s+/', '', $signatureContent[1][0]);
+            $decoded = $hex !== '' ? @hex2bin($hex) : false;
+            $derLength = is_string($decoded) ? cmsDerLength($decoded) : 0;
+            if (is_string($decoded) && $derLength > 0 && $derLength <= strlen($decoded)) {
+                $cms = substr($decoded, 0, $derLength);
+            } else {
+                $validRange = false;
+            }
+        } else {
+            $validRange = false;
+        }
+        if ($validRange && $cms !== '') {
             $gap = substr($contents, $range[1], $range[2] - $range[1]);
             $signatureToken = substr($contents, $signatureStart, $signatureEnd - $signatureStart);
             $validRange = $range[1] <= $signatureStart
                 && $range[2] >= $signatureEnd
                 && trim(str_replace($signatureToken, '', $gap)) === '';
-            $hex = preg_replace('/\s+/', '', $signatureContent[1][0]);
-            $decoded = $hex !== '' ? @hex2bin($hex) : false;
-            $derLength = is_string($decoded) ? cmsDerLength($decoded) : 0;
-            if ($validRange && is_string($decoded) && $derLength > 0 && $derLength <= strlen($decoded)) {
-                $cms = substr($decoded, 0, $derLength);
-            } else {
-                $validRange = false;
-            }
+        } else {
+            $validRange = false;
         }
 
         $signatureValid = false;
         $certificates = [];
+        if ($cms !== '') {
+            $pem = "-----BEGIN CMS-----\n" . chunk_split(base64_encode($cms), 64, "\n") . "-----END CMS-----\n";
+            $certificatePems = [];
+            $certificateFile = tempnam(sys_get_temp_dir(), 'metadata-certs-');
+            if ($certificateFile !== false) {
+                if (file_put_contents($certificateFile, $pem) !== false
+                    && @openssl_cms_read($certificateFile, $certificatePems)) {
+                    foreach ($certificatePems as $certificatePem) {
+                        $summary = summarizeCertificate($certificatePem);
+                        if ($summary !== null) {
+                            $certificates[] = $summary;
+                        }
+                    }
+                }
+                @unlink($certificateFile);
+            }
+        }
         if ($validRange && $cms !== '') {
             $signatureFile = tempnam(sys_get_temp_dir(), 'metadata-cms-');
             $contentFile = tempnam(sys_get_temp_dir(), 'metadata-signed-');
@@ -275,16 +298,6 @@ function verifyPdfSignatures(string $contents): array
                         $signatureFile,
                         OPENSSL_ENCODING_DER
                     ) === true;
-                    $pem = "-----BEGIN CMS-----\n" . chunk_split(base64_encode($cms), 64, "\n") . "-----END CMS-----\n";
-                    $certificatePems = [];
-                    if (@openssl_cms_read($pem, $certificatePems)) {
-                        foreach ($certificatePems as $certificatePem) {
-                            $summary = summarizeCertificate($certificatePem);
-                            if ($summary !== null) {
-                                $certificates[] = $summary;
-                            }
-                        }
-                    }
                 }
             }
             if (is_string($signatureFile)) {
@@ -526,6 +539,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <?php foreach ($result['signatures']['items'] as $signatureIndex => $signature): ?>
                                         <div class="signature-item">
                                             <p>Podpis <?= $signatureIndex + 1 ?>: <?= escape($signature['summary']) ?></p>
+                                            <?php if ($signature['certificates'] === []): ?><p>Nie udało się odczytać certyfikatu z bloku podpisu.</p><?php endif; ?>
                                             <?php foreach ($signature['certificates'] as $certificate): ?>
                                                 <dl class="certificate-list">
                                                     <div><dt>Podpisujący</dt><dd><?= escape($certificate['name']) ?></dd></div>
