@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+version_file=VERSION
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    current=$(git show "HEAD:$version_file" 2>/dev/null || printf '0.000')
+else
+    current=0.000
+fi
+
+if ! printf '%s\n' "$current" | grep -Eq '^[0-9]+\.[0-9]{3}$'; then
+    printf 'Nieprawidlowy format wersji w %s: %s\n' "$version_file" "$current" >&2
+    exit 1
+fi
+
+major=$(printf '%s' "${current%%.*}" | sed 's/^0*//')
+fraction=$(printf '%s' "${current#*.}" | sed 's/^0*//')
+major=${major:-0}
+fraction=${fraction:-0}
+next=$((major * 1000 + fraction + 1))
+next_version=$(printf '%d.%03d' "$((next / 1000))" "$((next % 1000))")
+
+printf '%s\n' "$next_version" > "$version_file"
+git add "$version_file"
