@@ -210,7 +210,7 @@ function verifyPdfSignatures(string $contents): array
     if ($ranges === []) {
         return ['status' => 'none', 'summary' => 'Nie znaleziono osadzonego podpisu cyfrowego PDF.', 'items' => []];
     }
-    if (!function_exists('openssl_cms_verify') || !function_exists('openssl_cms_read')) {
+    if (!function_exists('openssl_cms_verify') || !function_exists('openssl_pkcs7_read')) {
         return ['status' => 'unavailable', 'summary' => 'Weryfikacja podpisów PDF wymaga rozszerzenia PHP OpenSSL.', 'items' => []];
     }
 
@@ -264,20 +264,15 @@ function verifyPdfSignatures(string $contents): array
         $signatureValid = false;
         $certificates = [];
         if ($cms !== '') {
-            $pem = "-----BEGIN CMS-----\n" . chunk_split(base64_encode($cms), 64, "\n") . "-----END CMS-----\n";
+            $pem = "-----BEGIN PKCS7-----\n" . chunk_split(base64_encode($cms), 64, "\n") . "-----END PKCS7-----\n";
             $certificatePems = [];
-            $certificateFile = tempnam(sys_get_temp_dir(), 'metadata-certs-');
-            if ($certificateFile !== false) {
-                if (file_put_contents($certificateFile, $pem) !== false
-                    && @openssl_cms_read($certificateFile, $certificatePems)) {
-                    foreach ($certificatePems as $certificatePem) {
-                        $summary = summarizeCertificate($certificatePem);
-                        if ($summary !== null) {
-                            $certificates[] = $summary;
-                        }
+            if (@openssl_pkcs7_read($pem, $certificatePems)) {
+                foreach ($certificatePems as $certificatePem) {
+                    $summary = summarizeCertificate($certificatePem);
+                    if ($summary !== null) {
+                        $certificates[] = $summary;
                     }
                 }
-                @unlink($certificateFile);
             }
         }
         if ($validRange && $cms !== '') {
