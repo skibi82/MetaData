@@ -16,7 +16,7 @@ git config core.hooksPath .githooks
 
 ## Uruchomienie
 
-Wymagany PHP 8.0 lub nowszy. Rozszerzenie `zip` jest potrzebne dla plików Office, `exif` dla obrazów, a `curl` do online sprawdzania CRL. Rozszerzenie `openssl` jest potrzebne do weryfikacji podpisów PDF.
+Wymagany PHP 8.0 lub nowszy. Rozszerzenie `zip` jest potrzebne dla plików Office, `exif` dla obrazów, a `curl`, `dom` i `openssl` do pobrania TSL/CRL oraz weryfikacji podpisów i pełnego łańcucha PDF.
 
 ```sh
 php -S 127.0.0.1:8000
@@ -28,10 +28,12 @@ Pliki są przetwarzane w katalogu tymczasowym PHP i nie są zapisywane w katalog
 
 ## Sprawdzanie CRL
 
-Aplikacja odczytuje adresy z rozszerzenia `CRL Distribution Points` certyfikatu podpisującego. Nie utrzymuje statycznej listy adresów operatorów, ponieważ dostawcy mogą publikować osobne CRL dla kolejnych urzędów i generacji certyfikatów. Przed wynikiem „nie figuruje na CRL” sprawdzane są: certyfikat wystawcy pobrany z AIA lub osadzony w CMS, jego podpis pod certyfikatem podpisującego, podpis i wystawca listy CRL oraz jej okres ważności. Obsługiwane są pełne, bezpośrednie listy CRL bez ograniczeń punktu dystrybucji; niedostępna, nieaktualna lub nieobsługiwana lista daje status nieznany, a nie pozytywny.
+Aplikacja buduje łańcuch od certyfikatu podpisującego przez certyfikaty pośrednie do aktywnego korzenia z polskiej TSL. Weryfikuje podpis i skróty XMLDSIG TSL, jej okres ważności oraz certyfikat operatora TSL przypięty odciskiem SHA-256. Certyfikaty pośrednie są pobierane z CMS lub AIA, a pełną ścieżkę sprawdza OpenSSL względem korzenia z TSL. Urząd bezpośrednio wystawiający certyfikat podpisującego musi mieć w aktualnej TSL usługę `CA/QC` ze statusem `granted` oraz kwalifikacjami `ForeSignatures` i `QCForESig`.
+
+Status CRL jest weryfikowany dla każdego certyfikatu poza korzeniem, na podstawie jego `CRL Distribution Points`; obejmuje to również listy ARL NCCert dla certyfikatów Sub-CA. Nie ma jednej wspólnej CRL dla wszystkich wystawców. Obsługiwane są pełne, bezpośrednie listy CRL bez ograniczeń punktu dystrybucji. Niedostępna, nieaktualna lub nieobsługiwana lista daje status nieznany, a nie pozytywny. Jeśli nie można zweryfikować podpisanej TSL, kwalifikacji CA/QC lub aktywnego korzenia, aplikacja nie uznaje ścieżki za zaufaną. Zmiana certyfikatu operatora TSL wymaga aktualizacji przypiętego odcisku; do tego czasu walidacja TSL kończy się statusem nieznanym.
 
 Polska Zaufana Lista (TSL) publikowana przez Narodowe Centrum Certyfikacji zawiera kwalifikowanych dostawców i punkty dystrybucji usług: [PL_TSL.xml](https://www.nccert.pl/tsl/PL_TSL.xml), [opis TSL](https://www.nccert.pl/tsl.htm). Przykłady punktów CRL usług certyfikacji widocznych w TSL: KIR `http://elektronicznypodpis.pl/crl/crl_ozk62.crl`, PWPW/Sigillum `http://crl.sigillum.pl/repozytorium/qca2_2026.crl`, Cencert `http://crl.cencert.pl/crl/qca_2023.crl`, EuroCert `http://crl.eurocert.pl/qca06.crl` i Certum `http://qcag3r35.crl.certum.pl/qcag3r35.crl` (stan sprawdzenia: 13 października 2026 r.). Konkretne certyfikaty mogą wskazywać inne lub nowsze adresy; aplikacja pobiera je z certyfikatu.
 
 CRL publikowane przez NCCert na stronie [Lista CRL](https://www.nccert.pl/crl.htm) (`nccert2016.crl`, `nccert-n.crl` i `nccert.crl`) dotyczą certyfikatów dostawców wydanych przez krajowe urzędy NCCert. Nie są zamiennikiem CRL urzędu, który wystawił certyfikat osoby podpisującej.
 
-Wynik integralności podpisu PDF, status CRL i zaufanie do łańcucha są odrębnymi informacjami. Zaufanie jest sprawdzane względem lokalnego magazynu OpenSSL; status CRL nie potwierdza sam w sobie kwalifikowanego statusu usługi. OCSP nie jest obsługiwane. Typowe pliki JPG/TIFF nie przechowują podpisu cyfrowego w obsługiwanym przez tę aplikację formacie.
+Integralność kryptograficzna podpisu, weryfikacja łańcucha do polskiego korzenia, lokalne zaufanie OpenSSL i status CRL są odrębnymi wynikami. Wpis CA/QC w TSL nie stanowi sam w sobie pełnej oceny wszystkich cech podpisu kwalifikowanego, w tym użycia QSCD i wiarygodnego znacznika czasu. OCSP nie jest obsługiwane. Typowe pliki JPG/TIFF nie przechowują podpisu cyfrowego w obsługiwanym przez tę aplikację formacie.

@@ -5,6 +5,8 @@ session_start();
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_FILES = 10;
+const POLISH_TSL_URL = 'https://www.nccert.pl/tsl/PL_TSL.xml';
+const POLISH_TSL_OPERATOR_FINGERPRINT = '446A041A550BC51B92525EF7E540090B2DF67F0852E5C7ADDB96661CCE330596';
 
 $labels = [
     'author' => 'Autor', 'company' => 'Firma', 'title' => 'Tytuł',
@@ -446,6 +448,203 @@ function findCertificateIssuer(string $certificate, array $embeddedCertificates)
     return null;
 }
 
+function trustedListCertificate(string $certificateData): ?string
+{
+    $der = base64_decode(preg_replace('/\s+/', '', $certificateData), true);
+    if (!is_string($der) || $der === '') {
+        return null;
+    }
+    return "-----BEGIN CERTIFICATE-----\n" . chunk_split(base64_encode($der), 64, "\n") . "-----END CERTIFICATE-----\n";
+}
+
+function loadPolishTrustedList(): ?array
+{
+    static $trustedList = null;
+    static $loaded = false;
+    if ($loaded) {
+        return is_array($trustedList) ? $trustedList : null;
+    }
+    $loaded = true;
+    $xml = fetchValidationResource(POLISH_TSL_URL);
+    if (!is_string($xml)) {
+        $xml = fetchValidationResource('http://www.nccert.pl/tsl/PL_TSL.xml');
+    }
+    if (!is_string($xml) || !class_exists(DOMDocument::class)) {
+        return null;
+    }
+    $document = new DOMDocument();
+    $document->preserveWhiteSpace = true;
+    if (!@$document->loadXML($xml, LIBXML_NONET | LIBXML_COMPACT)
+        || $document->documentElement?->localName !== 'TrustServiceStatusList') {
+        return null;
+    }
+    $xpath = new DOMXPath($document);
+    $signatures = $xpath->query('./*[local-name()="Signature" and namespace-uri()="http://www.w3.org/2000/09/xmldsig#"]', $document->documentElement);
+    $signedInfo = $xpath->query('./*[local-name()="SignedInfo"]', $signatures?->item(0));
+    $signatureValue = base64_decode(trim($xpath->evaluate('string(./*[local-name()="SignatureValue"])', $signatures?->item(0))), true);
+    if ($signatures === false || $signatures->length !== 1 || $signedInfo === false || $signedInfo->length !== 1
+        || !is_string($signatureValue)) {
+        return null;
+    }
+    $canonicalizationMethod = trim($xpath->evaluate('string(./*[local-name()="CanonicalizationMethod"]/@Algorithm)', $signedInfo->item(0)));
+    $signatureMethod = trim($xpath->evaluate('string(./*[local-name()="SignatureMethod"]/@Algorithm)', $signedInfo->item(0)));
+    if ($canonicalizationMethod !== 'http://www.w3.org/2001/10/xml-exc-c14n#'
+        || $signatureMethod !== 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha512') {
+        return null;
+    }
+    $operatorCertificate = null;
+    foreach ($xpath->query('./*[local-name()="KeyInfo"]//*[local-name()="X509Certificate"]', $signatures->item(0)) ?: [] as $certificateNode) {
+        $candidate = trustedListCertificate($certificateNode->textContent);
+        if ($candidate !== null
+            && strtoupper((string) openssl_x509_fingerprint($candidate, 'sha256')) === POLISH_TSL_OPERATOR_FINGERPRINT) {
+            $operatorCertificate = $candidate;
+            break;
+        }
+    }
+    $operatorInfo = is_string($operatorCertificate) ? @openssl_x509_parse($operatorCertificate) : false;
+    if (!is_array($operatorInfo)
+        || @openssl_x509_verify($operatorCertificate, $operatorCertificate) !== 1
+        || (int) ($operatorInfo['validFrom_time_t'] ?? 0) > time()
+        || (int) ($operatorInfo['validTo_time_t'] ?? 0) < time()) {
+        return null;
+    }
+    $references = $xpath->query('./*[local-name()="Reference"]', $signedInfo->item(0));
+    if ($references === false || $references->length === 0) {
+        return null;
+    }
+    $documentReferenceVerified = false;
+    foreach ($references as $reference) {
+        $uri = $reference->getAttribute('URI');
+        $digestAlgorithm = trim($xpath->evaluate('string(./*[local-name()="DigestMethod"]/@Algorithm)', $reference));
+        $digestValue = base64_decode(trim($xpath->evaluate('string(./*[local-name()="DigestValue"])', $reference)), true);
+        $transforms = $xpath->query('./*[local-name()="Transforms"]/*[local-name()="Transform"]', $reference);
+        if ($digestAlgorithm !== 'http://www.w3.org/2001/04/xmlenc#sha512'
+            || !is_string($digestValue)
+            || $transforms === false) {
+            return null;
+        }
+        $transformAlgorithms = [];
+        foreach ($transforms as $transform) {
+            $transformAlgorithms[] = $transform->getAttribute('Algorithm');
+        }
+        if ($uri === '') {
+            if ($transformAlgorithms !== [
+                'http://www.w3.org/2000/09/xmldsig#enveloped-signature',
+                'http://www.w3.org/2001/10/xml-exc-c14n#',
+            ]) {
+                return null;
+            }
+            $referenceDocument = $document->cloneNode(true);
+            $referenceXPath = new DOMXPath($referenceDocument);
+            $referenceSignatures = $referenceXPath->query('//*[local-name()="Signature" and namespace-uri()="http://www.w3.org/2000/09/xmldsig#"]');
+            if ($referenceSignatures === false || $referenceSignatures->length !== 1) {
+                return null;
+            }
+            $referenceSignatures->item(0)->parentNode?->removeChild($referenceSignatures->item(0));
+            $referenceNode = $referenceDocument->documentElement;
+            $documentReferenceVerified = true;
+        } elseif (preg_match('/^#[A-Za-z0-9._:-]+$/', $uri) === 1
+            && $transformAlgorithms === ['http://www.w3.org/2001/10/xml-exc-c14n#']) {
+            $fragmentId = substr($uri, 1);
+            $referenceNode = null;
+            $idMatches = 0;
+            foreach ($xpath->query('//*[@Id]') ?: [] as $candidateNode) {
+                if ($candidateNode instanceof DOMElement && $candidateNode->getAttribute('Id') === $fragmentId) {
+                    $referenceNode = $candidateNode;
+                    $idMatches++;
+                }
+            }
+            if ($idMatches !== 1 || !$referenceNode instanceof DOMElement) {
+                return null;
+            }
+        } else {
+            return null;
+        }
+        $canonicalReference = $referenceNode->C14N(true, false);
+        if (!is_string($canonicalReference)
+            || !hash_equals($digestValue, hash('sha512', $canonicalReference, true))) {
+            return null;
+        }
+    }
+    $canonicalSignedInfo = $signedInfo->item(0)->C14N(true, false);
+    if (!$documentReferenceVerified || !is_string($canonicalSignedInfo)
+        || @openssl_verify($canonicalSignedInfo, $signatureValue, $operatorCertificate, OPENSSL_ALGO_SHA512) !== 1) {
+        return null;
+    }
+    $schemeInformation = $xpath->query('//*[local-name()="SchemeInformation"]')->item(0);
+    $issueDate = strtotime(trim($xpath->evaluate('string(./*[local-name()="ListIssueDateTime"])', $schemeInformation)));
+    $nextUpdate = strtotime(trim($xpath->evaluate('string(./*[local-name()="NextUpdate"])', $schemeInformation)));
+    if ($issueDate === false || $nextUpdate === false || $issueDate > time() + 300 || $nextUpdate < time()) {
+        return null;
+    }
+    $roots = [];
+    $qualifiedAuthorities = [];
+    foreach ($xpath->query('//*[local-name()="TSPService"]/*[local-name()="ServiceInformation"]') ?: [] as $service) {
+        $serviceType = trim($xpath->evaluate('string(./*[local-name()="ServiceTypeIdentifier"])', $service));
+        $serviceStatus = trim($xpath->evaluate('string(./*[local-name()="ServiceStatus"])', $service));
+        $serviceStarting = strtotime(trim($xpath->evaluate('string(./*[local-name()="StatusStartingTime"])', $service)));
+        if ($serviceStarting === false || $serviceStarting > time()) {
+            continue;
+        }
+        $isRoot = str_ends_with($serviceType, '/NationalRootCA-QC')
+            && in_array($serviceStatus, [
+                'http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/recognisedatnationallevel',
+                'http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted',
+            ], true);
+        $isQualifiedAuthority = str_ends_with($serviceType, '/CA/QC')
+            && $serviceStatus === 'http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted';
+        if ($isQualifiedAuthority) {
+            $hasForeSignatures = false;
+            $hasQualifiedSignatureCertificates = false;
+            $serviceExtensions = $xpath->query('./*[local-name()="ServiceInformationExtensions"]', $service)?->item(0);
+            if ($serviceExtensions instanceof DOMElement) {
+                foreach ($xpath->query('.//*[local-name()="URI"]', $serviceExtensions) ?: [] as $qualification) {
+                    $qualificationUri = trim($qualification->textContent);
+                    $hasForeSignatures = $hasForeSignatures
+                        || $qualificationUri === 'http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSignatures';
+                }
+                foreach ($xpath->query('.//*[local-name()="Qualifier"]', $serviceExtensions) ?: [] as $qualification) {
+                    $qualificationUri = trim($qualification->getAttribute('uri'));
+                    $hasQualifiedSignatureCertificates = $hasQualifiedSignatureCertificates
+                        || $qualificationUri === 'http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/QCForESig';
+                }
+            }
+            $isQualifiedAuthority = $hasForeSignatures && $hasQualifiedSignatureCertificates;
+        }
+        if (!$isRoot && !$isQualifiedAuthority) {
+            continue;
+        }
+        foreach ($xpath->query('./*[local-name()="ServiceDigitalIdentity"]//*[local-name()="X509Certificate"]', $service) ?: [] as $certificateNode) {
+            $pem = trustedListCertificate($certificateNode->textContent);
+            if ($pem === null || !is_array($parsedCertificate = @openssl_x509_parse($pem))) {
+                continue;
+            }
+            $fingerprint = strtoupper((string) openssl_x509_fingerprint($pem, 'sha256'));
+            if ($isRoot
+                && (int) ($parsedCertificate['validFrom_time_t'] ?? 0) <= time()
+                && (int) ($parsedCertificate['validTo_time_t'] ?? 0) >= time()
+                && @openssl_x509_verify($pem, $pem) === 1) {
+                $roots[$fingerprint] = $pem;
+            } elseif ($isQualifiedAuthority) {
+                $qualifiedAuthorities[$fingerprint] = [
+                    'certificate' => $pem,
+                    'name' => (string) ($parsedCertificate['subject']['CN'] ?? $parsedCertificate['subject']['O'] ?? 'Kwalifikowany urząd certyfikacji'),
+                ];
+            }
+        }
+    }
+    if ($roots === []) {
+        return null;
+    }
+    $trustedList = [
+        'roots' => $roots,
+        'qualified_authorities' => $qualifiedAuthorities,
+        'sequence' => trim($xpath->evaluate('string(//*[local-name()="TSLSequenceNumber"])')),
+        'next_update' => $nextUpdate,
+    ];
+    return $trustedList;
+}
+
 function parseAsn1Time(string $data, array $element): ?int
 {
     $value = substr($data, $element['content'], $element['length']);
@@ -642,6 +841,127 @@ function certificateRevocationStatus(string $certificate, array $embeddedCertifi
     ];
 }
 
+function validateCertificateChain(string $certificate, array $embeddedCertificates): array
+{
+    $trustedList = loadPolishTrustedList();
+    if (!is_array($trustedList)) {
+        return [
+            'status' => 'unknown',
+            'message' => 'Nie udało się zweryfikować podpisanej polskiej listy TSL.',
+            'certificates' => [],
+        ];
+    }
+    $certificatePool = array_merge($embeddedCertificates, array_values($trustedList['roots']));
+    $chain = [];
+    $seenFingerprints = [];
+    $current = $certificate;
+    $rootCertificate = null;
+    for ($depth = 0; $depth < 8; $depth++) {
+        $fingerprint = strtoupper((string) openssl_x509_fingerprint($current, 'sha256'));
+        if ($fingerprint === '' || isset($seenFingerprints[$fingerprint])) {
+            break;
+        }
+        $seenFingerprints[$fingerprint] = true;
+        $chain[] = $current;
+        if (isset($trustedList['roots'][$fingerprint])) {
+            $rootCertificate = $current;
+            break;
+        }
+        $issuerCertificate = findCertificateIssuer($current, $certificatePool);
+        if (!is_string($issuerCertificate)) {
+            break;
+        }
+        $certificatePool[] = $issuerCertificate;
+        $current = $issuerCertificate;
+    }
+    if (!is_string($rootCertificate)) {
+        return [
+            'status' => 'unknown',
+            'message' => 'Nie udało się zbudować łańcucha do aktywnego korzenia z polskiej TSL.',
+            'certificates' => array_map(static function (string $chainCertificate, int $index) use ($chain): array {
+                $parsed = @openssl_x509_parse($chainCertificate);
+                return [
+                    'name' => (string) (($parsed['subject']['CN'] ?? null) ?: ($parsed['subject']['O'] ?? 'Certyfikat')),
+                    'role' => $index === 0 ? 'Podpisujący' : 'Urząd pośredni',
+                    'fingerprint' => strtoupper((string) openssl_x509_fingerprint($chainCertificate, 'sha256')),
+                ];
+            }, $chain, array_keys($chain)),
+        ];
+    }
+    $rootFingerprint = strtoupper((string) openssl_x509_fingerprint($rootCertificate, 'sha256'));
+    $rootPath = tempnam(sys_get_temp_dir(), 'metadata-root-');
+    $intermediatesPath = tempnam(sys_get_temp_dir(), 'metadata-chain-');
+    if ($rootPath === false || $intermediatesPath === false) {
+        if (is_string($rootPath)) {
+            @unlink($rootPath);
+        }
+        if (is_string($intermediatesPath)) {
+            @unlink($intermediatesPath);
+        }
+        return ['status' => 'unknown', 'message' => 'Nie udało się przygotować weryfikacji łańcucha.', 'certificates' => []];
+    }
+    $intermediateCertificates = array_slice($chain, 1, -1);
+    $filesWritten = file_put_contents($rootPath, $rootCertificate) !== false
+        && file_put_contents($intermediatesPath, implode("\n", $intermediateCertificates)) !== false;
+    $pathTrusted = false;
+    if ($filesWritten) {
+        $untrustedPath = $intermediateCertificates === [] ? null : $intermediatesPath;
+        $pathTrusted = @openssl_x509_checkpurpose($certificate, X509_PURPOSE_ANY, [$rootPath], $untrustedPath) === true;
+    }
+    @unlink($rootPath);
+    @unlink($intermediatesPath);
+    if (!$pathTrusted) {
+        return ['status' => 'invalid', 'message' => 'OpenSSL odrzucił łańcuch certyfikatów (podpis, ważność lub ograniczenia CA).', 'certificates' => []];
+    }
+    $authority = $chain[1] ?? $rootCertificate;
+    $authorityFingerprint = strtoupper((string) openssl_x509_fingerprint($authority, 'sha256'));
+    $qualifiedAuthority = isset($trustedList['qualified_authorities'][$authorityFingerprint]);
+    $certificateStatuses = [];
+    $hasUnknownRevocation = false;
+    $hasRevokedCertificate = false;
+    foreach ($chain as $index => $chainCertificate) {
+        $parsed = @openssl_x509_parse($chainCertificate);
+        $isRoot = $index === count($chain) - 1;
+        $revocation = $isRoot
+            ? ['status' => 'good', 'message' => 'Korzeń znajduje się na aktualnej polskiej TSL.', 'source' => POLISH_TSL_URL]
+            : certificateRevocationStatus($chainCertificate, $chain);
+        $hasUnknownRevocation = $hasUnknownRevocation || $revocation['status'] === 'unknown';
+        $hasRevokedCertificate = $hasRevokedCertificate || $revocation['status'] === 'revoked';
+        $certificateStatuses[] = [
+            'name' => (string) (($parsed['subject']['CN'] ?? null) ?: ($parsed['subject']['O'] ?? 'Certyfikat')),
+            'role' => $index === 0 ? 'Podpisujący' : ($isRoot ? 'Korzeń' : 'Sub-CA'),
+            'fingerprint' => strtoupper((string) openssl_x509_fingerprint($chainCertificate, 'sha256')),
+            'revocation' => $revocation,
+        ];
+    }
+    if (!$qualifiedAuthority) {
+        return [
+            'status' => 'not_qualified',
+            'message' => 'Ścieżka dochodzi do korzenia TSL, ale wystawca podpisującego nie ma aktywnego wpisu CA/QC.',
+            'certificates' => $certificateStatuses,
+        ];
+    }
+    if ($hasRevokedCertificate) {
+        return [
+            'status' => 'revoked',
+            'message' => 'Co najmniej jeden certyfikat w łańcuchu figuruje na aktualnej CRL.',
+            'certificates' => $certificateStatuses,
+        ];
+    }
+    if ($hasUnknownRevocation) {
+        return [
+            'status' => 'unknown',
+            'message' => 'Łańcuch jest poprawny, ale nie udało się zweryfikować CRL dla każdego certyfikatu.',
+            'certificates' => $certificateStatuses,
+        ];
+    }
+    return [
+        'status' => 'valid',
+        'message' => 'Pełny łańcuch prowadzi do aktywnego korzenia NCCert; wystawca ma status CA/QC w TSL, a CRL są aktualne.',
+        'certificates' => $certificateStatuses,
+    ];
+}
+
 function verifyPdfSignatures(string $contents): array
 {
     preg_match_all('~/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]~', $contents, $ranges, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
@@ -693,10 +1013,49 @@ function verifyPdfSignatures(string $contents): array
             $pem = "-----BEGIN PKCS7-----\n" . chunk_split(base64_encode($cms), 64, "\n") . "-----END PKCS7-----\n";
             $certificatePems = [];
             if (@openssl_pkcs7_read($pem, $certificatePems)) {
+                $signerFingerprints = [];
+                foreach ($certificatePems as $candidate) {
+                    $candidateSubject = certificateNameDer($candidate, 'subject');
+                    $isIssuer = false;
+                    foreach ($certificatePems as $child) {
+                        if ($candidate === $child || certificateNameDer($child, 'issuer') !== $candidateSubject) {
+                            continue;
+                        }
+                        if (@openssl_x509_verify($child, $candidate) === 1) {
+                            $isIssuer = true;
+                            break;
+                        }
+                    }
+                    if (!$isIssuer) {
+                        $fingerprint = strtoupper((string) openssl_x509_fingerprint($candidate, 'sha256'));
+                        if ($fingerprint !== '') {
+                            $signerFingerprints[$fingerprint] = true;
+                        }
+                    }
+                }
+                $chainReports = [];
+                $chainRevocations = [];
+                foreach ($certificatePems as $candidate) {
+                    $fingerprint = strtoupper((string) openssl_x509_fingerprint($candidate, 'sha256'));
+                    if (!isset($signerFingerprints[$fingerprint])) {
+                        continue;
+                    }
+                    $chainReport = validateCertificateChain($candidate, $certificatePems);
+                    $chainReports[$fingerprint] = $chainReport;
+                    foreach ($chainReport['certificates'] as $chainCertificate) {
+                        if (isset($chainCertificate['revocation'])) {
+                            $chainRevocations[$chainCertificate['fingerprint']] = $chainCertificate['revocation'];
+                        }
+                    }
+                }
                 foreach ($certificatePems as $certificatePem) {
                     $summary = summarizeCertificate($certificatePem);
                     if ($summary !== null) {
-                        $summary['revocation'] = certificateRevocationStatus($certificatePem, $certificatePems);
+                        $summary['revocation'] = $chainRevocations[$summary['fingerprint']]
+                            ?? certificateRevocationStatus($certificatePem, $certificatePems);
+                        if (isset($chainReports[$summary['fingerprint']])) {
+                            $summary['chain'] = $chainReports[$summary['fingerprint']];
+                        }
                         $certificates[] = $summary;
                     }
                 }
@@ -1005,14 +1364,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                                     <div><dt>Podpisujący</dt><dd><?= escape($certificate['name']) ?></dd></div>
                                                     <div><dt>Wystawca</dt><dd><?= escape($certificate['issuer']) ?></dd></div>
                                                     <div><dt>Ważność</dt><dd><?= escape($certificate['valid_from']) ?> – <?= escape($certificate['valid_to']) ?> · <?= $certificate['currently_valid'] ? 'ważny obecnie' : 'poza okresem ważności' ?></dd></div>
-                                                    <div><dt>Zaufanie</dt><dd><?= $certificate['trusted'] ? 'łańcuch zaufany przez lokalny OpenSSL' : 'łańcuch niezaufany lub niezweryfikowany' ?></dd></div>
+                                                    <div><dt>Zaufanie lokalne</dt><dd><?= $certificate['trusted'] ? 'certyfikat zaufany przez lokalny magazyn OpenSSL' : 'certyfikat niezaufany lub niezweryfikowany przez lokalny magazyn OpenSSL' ?></dd></div>
                                                     <div><dt>Status CRL</dt><dd><?= escape($certificate['revocation']['message']) ?><?php if ($certificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($certificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło CRL</a><?php endif; ?></dd></div>
+                                                    <?php if (isset($certificate['chain'])): ?><div><dt>Łańcuch zaufania</dt><dd><strong class="chain-status-<?= escape($certificate['chain']['status']) ?>"><?= escape($certificate['chain']['message']) ?></strong><?php if ($certificate['chain']['certificates'] !== []): ?><ol class="certificate-chain-path"><?php foreach ($certificate['chain']['certificates'] as $chainCertificate): ?><li><?= escape($chainCertificate['role']) ?>: <?= escape($chainCertificate['name']) ?><?php if (isset($chainCertificate['revocation'])): ?> · <?= escape($chainCertificate['revocation']['message']) ?><?php if ($chainCertificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($chainCertificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło</a><?php endif; ?><?php endif; ?></li><?php endforeach; ?></ol><?php endif; ?></dd></div><?php endif; ?>
                                                     <div><dt>SHA-256</dt><dd><?= escape($certificate['fingerprint']) ?></dd></div>
                                                 </dl>
                                             <?php endforeach; ?>
                                         </div>
                                     <?php endforeach; ?>
-                                    <?php if ($result['signatures']['status'] !== 'none'): ?><p class="signature-caveat">Zaufanie jest sprawdzane względem lokalnego magazynu CA. Status CRL jest pobierany z adresu podanego w certyfikacie; OCSP nie jest obsługiwane.</p><?php endif; ?>
+                                    <?php if ($result['signatures']['status'] !== 'none'): ?><p class="signature-caveat">Integralność podpisu, łańcuch certyfikatów i zaufanie lokalne to odrębne wyniki. Łańcuch jest sprawdzany względem podpisanej polskiej TSL i CRL wskazanych przez kolejne certyfikaty; OCSP nie jest obsługiwane.</p><?php endif; ?>
                                 </div>
                             <?php endif; ?>
                         </article>
