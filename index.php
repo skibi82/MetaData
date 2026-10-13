@@ -1405,23 +1405,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <?php if ($results !== []): ?>
             <section class="results" aria-live="polite">
                 <div class="results-heading"><div><p class="eyebrow">WYNIK ANALIZY</p><h2><?= count($results) ?> <?= count($results) === 1 ? 'plik' : 'plików' ?></h2></div><span class="result-caption">Metadane dostępne w przesłanych plikach</span></div>
-                <?php if ($comparisons !== []): ?>
-                    <div class="matches">
-                        <div class="matches-title"><span class="match-icon" aria-hidden="true">=</span><strong>Znaleziono wspólne dane</strong></div>
-                        <?php foreach ($comparisons as $comparison): ?>
-                            <div class="match-row">
-                                <div class="match-files"><span><?= escape($results[$comparison['left']]['name']) ?></span><span class="match-arrow" aria-hidden="true">↔</span><span><?= escape($results[$comparison['right']]['name']) ?></span></div>
-                                <div class="match-values">
-                                    <?php foreach ($comparison['matches'] as $key => $value): ?>
-                                        <span class="match-chip <?= in_array($key, ['author', 'company'], true) ? 'match-important' : '' ?>"><b><?= escape($labels[$key] ?? $key) ?>:</b> <?= escape($value) ?></span>
-                                    <?php endforeach; ?>
-                                </div>
-                            </div>
-                        <?php endforeach; ?>
-                    </div>
-                <?php elseif (count($results) > 1): ?>
-                    <div class="notice notice-neutral">Nie znaleziono identycznych, niepustych wartości metadanych między poprawnie odczytanymi plikami.</div>
-                <?php endif; ?>
                 <div class="file-results">
                     <?php foreach ($results as $result): ?>
                         <article class="file-result">
@@ -1455,6 +1438,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         </article>
                     <?php endforeach; ?>
                 </div>
+                <?php if ($comparisons !== []): ?>
+                    <div class="matches">
+                        <div class="matches-title"><span class="match-icon" aria-hidden="true">=</span><strong>Znaleziono wspólne dane</strong></div>
+                        <?php foreach ($comparisons as $comparison): ?>
+                            <div class="match-row">
+                                <div class="match-files"><span><?= escape($results[$comparison['left']]['name']) ?></span><span class="match-arrow" aria-hidden="true">↔</span><span><?= escape($results[$comparison['right']]['name']) ?></span></div>
+                                <div class="match-values">
+                                    <?php foreach ($comparison['matches'] as $key => $value): ?>
+                                        <span class="match-chip <?= in_array($key, ['author', 'company'], true) ? 'match-important' : '' ?>"><b><?= escape($labels[$key] ?? $key) ?>:</b> <?= escape($value) ?></span>
+                                    <?php endforeach; ?>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php elseif (count($results) > 1): ?>
+                    <div class="notice notice-neutral">Nie znaleziono identycznych, niepustych wartości metadanych między poprawnie odczytanymi plikami.</div>
+                <?php endif; ?>
             </section>
         <?php endif; ?>
     </section>
