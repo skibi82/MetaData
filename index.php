@@ -28,6 +28,69 @@ function escape(string $value): string
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function normalizeMetadataDate(string $value, ?string $timezoneOffset = null): ?string
+{
+    $value = trim($value);
+    $year = $month = $day = 0;
+    $hour = $minute = $second = 0;
+    $sourceTimezone = $timezoneOffset;
+    if (preg_match('~^D:(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?(Z|[+-].*)?$~i', $value, $match)) {
+        $year = (int) $match[1];
+        $month = (int) $match[2];
+        $day = (int) $match[3];
+        $hour = isset($match[4]) ? (int) $match[4] : 0;
+        $minute = isset($match[5]) ? (int) $match[5] : 0;
+        $second = isset($match[6]) ? (int) $match[6] : 0;
+        $sourceTimezone ??= $match[7] ?? null;
+        if (is_string($sourceTimezone) && preg_match("~^([+-])(\\d{2})'?(:?)(\\d{2})?'?$~", $sourceTimezone, $offset)) {
+            $sourceTimezone = $offset[1] . $offset[2] . ($offset[4] ?? '00');
+        }
+    } elseif (preg_match('~^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):?(\d{2})(?::?(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$~i', $value, $match)) {
+        $year = (int) $match[1];
+        $month = (int) $match[2];
+        $day = (int) $match[3];
+        $hour = isset($match[4]) ? (int) $match[4] : 0;
+        $minute = isset($match[5]) ? (int) $match[5] : 0;
+        $second = isset($match[6]) ? (int) $match[6] : 0;
+        $sourceTimezone ??= $match[7] ?? null;
+    } elseif (preg_match('~^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$~', $value, $match)) {
+        $year = (int) $match[1];
+        $month = (int) $match[2];
+        $day = (int) $match[3];
+        $hour = (int) $match[4];
+        $minute = (int) $match[5];
+        $second = (int) $match[6];
+    } else {
+        return null;
+    }
+    if (!checkdate($month, $day, $year) || $hour > 23 || $minute > 59 || $second > 59) {
+        return null;
+    }
+    $localDateTime = sprintf('%04d-%02d-%02dT%02d:%02d:%02d', $year, $month, $day, $hour, $minute, $second);
+    if ($sourceTimezone === null || $sourceTimezone === '') {
+        return $localDateTime;
+    }
+    if (strtoupper($sourceTimezone) === 'Z') {
+        $sourceTimezone = '+00:00';
+    } elseif (preg_match('~^([+-])(\d{2}):?(\d{2})$~', $sourceTimezone, $offset)) {
+        $offsetHours = (int) $offset[2];
+        $offsetMinutes = (int) $offset[3];
+        if ($offsetHours > 14 || $offsetMinutes > 59 || ($offsetHours === 14 && $offsetMinutes !== 0)) {
+            return null;
+        }
+        $sourceTimezone = $offset[1] . $offset[2] . ':' . $offset[3];
+    } else {
+        return null;
+    }
+    try {
+        return (new DateTimeImmutable($localDateTime . $sourceTimezone))
+            ->setTimezone(new DateTimeZone('UTC'))
+            ->format('Y-m-d\TH:i:s\Z');
+    } catch (Throwable) {
+        return null;
+    }
+}
+
 function addMetadata(array &$metadata, string $key, mixed $value): void
 {
     if (is_array($value)) {
@@ -37,6 +100,9 @@ function addMetadata(array &$metadata, string $key, mixed $value): void
         return;
     }
     $value = trim((string) $value);
+    if (in_array($key, ['created', 'modified'], true)) {
+        $value = normalizeMetadataDate($value) ?? $value;
+    }
     if ($value !== '') {
         $metadata[$key] = $value;
     }
@@ -1181,6 +1247,17 @@ function flattenExif(array $data, array &$metadata): void
             continue;
         }
         $metadataKey = $mapping[$key];
+        if (in_array($key, ['datetimeoriginal', 'datetime', 'datetimedigitized'], true)) {
+            $offsetKey = match ($key) {
+                'datetimeoriginal' => 'offsettimeoriginal',
+                'datetime' => 'offsettime',
+                'datetimedigitized' => 'offsettimedigitized',
+            };
+            $offset = $data[$offsetKey] ?? null;
+            if (is_scalar($offset)) {
+                $value = normalizeMetadataDate((string) $value, (string) $offset) ?? $value;
+            }
+        }
         if ($metadataKey === 'camera' && isset($metadata[$metadataKey])) {
             addMetadata($metadata, $metadataKey, $metadata[$metadataKey] . ' ' . (string) $value);
         } else {
@@ -1351,7 +1428,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="file-heading"><span class="file-type" aria-hidden="true"><?= escape(strtoupper(pathinfo($result['name'], PATHINFO_EXTENSION))) ?></span><div class="file-name-wrap"><h3><?= escape($result['name']) ?></h3><p><?= $result['error'] !== '' ? 'Nie udało się odczytać' : count($result['metadata']) . ' odczytanych pól' ?></p></div><span class="file-state <?= $result['error'] !== '' ? 'state-error' : '' ?>" aria-label="<?= $result['error'] !== '' ? 'Błąd' : 'Przeanalizowano' ?>"></span></div>
                             <?php if ($result['error'] !== ''): ?><p class="file-error"><?= escape($result['error']) ?></p>
                             <?php elseif ($result['metadata'] === []): ?><p class="empty-metadata">Ten plik nie zawiera odczytywalnych metadanych.</p>
-                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape($labels[$key] ?? $key) ?></dt><dd><?= escape($value) ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
+                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape($labels[$key] ?? $key) ?></dt><dd><?php if (in_array($key, ['created', 'modified'], true) && preg_match('~^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$~', $value)): ?><time class="metadata-date" datetime="<?= escape($value) ?>"><?= escape($value) ?></time><?php else: ?><?= escape($value) ?><?php endif; ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
                             <?php if (is_array($result['signatures'])): ?>
                                 <div class="signature-report">
                                     <div class="signature-heading"><strong>Podpis cyfrowy</strong><span class="signature-status status-<?= escape($result['signatures']['status']) ?>"><?= escape($result['signatures']['summary']) ?></span></div>
@@ -1384,6 +1461,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <footer class="page-footer"><span>INFORMACJA O PRYWATNOŚCI</span>Pliki są analizowane w pamięci serwera i nie są zapisywane na dysku aplikacji.</footer>
 </main>
 <script>
+for (const dateElement of document.querySelectorAll('time.metadata-date')) {
+    const source = dateElement.dateTime;
+    const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(source);
+    const date = new Date(hasTimezone ? source : `${source}Z`);
+    if (Number.isNaN(date.getTime())) {
+        continue;
+    }
+    const parts = new Intl.DateTimeFormat(navigator.language || 'pl-PL', {
+        timeZone: hasTimezone ? undefined : 'UTC',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    dateElement.textContent = `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}`;
+}
 const fileInput = document.getElementById('files');
 const fileSummary = document.getElementById('file-summary');
 const dropzone = document.querySelector('.dropzone');

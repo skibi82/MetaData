@@ -26,6 +26,8 @@ Otwórz `http://127.0.0.1:8000`.
 
 Pliki są przetwarzane w katalogu tymczasowym PHP i nie są zapisywane w katalogu aplikacji. Limit wynosi 20 MB na plik i 10 plików na analizę. Porównanie ignoruje wielkość liter i nadmiarowe białe znaki. Szyfrowane PDF-y oraz wartości zapisane wyłącznie w niestandardowych rozszerzeniach mogą nie zostać odczytane. W konfiguracji PHP `upload_max_filesize` i `post_max_size` powinny wynosić co najmniej 20 MB.
 
+Daty utworzenia i modyfikacji z PDF, Office i EXIF są wyświetlane jako `YYYY-MM-DD HH:mm` w języku przeglądarki. Gdy plik zawiera offset lub strefę czasową, godzina jest przeliczana do lokalnej strefy urządzenia przeglądającego. Daty bez informacji o strefie zachowują zapisany czas lokalny, ponieważ nie da się wiarygodnie ustalić ich offsetu.
+
 ## Sprawdzanie CRL
 
 Aplikacja buduje łańcuch od certyfikatu podpisującego przez certyfikaty pośrednie do aktywnego korzenia z polskiej TSL. Weryfikuje podpis i skróty XMLDSIG TSL, jej okres ważności oraz certyfikat operatora TSL przypięty odciskiem SHA-256. Certyfikaty pośrednie są pobierane z CMS lub AIA, a pełną ścieżkę sprawdza OpenSSL względem korzenia z TSL. Urząd bezpośrednio wystawiający certyfikat podpisującego musi mieć w aktualnej TSL usługę `CA/QC` ze statusem `granted` oraz kwalifikacjami `ForeSignatures` i `QCForESig`.
