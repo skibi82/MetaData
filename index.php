@@ -28,6 +28,24 @@ function escape(string $value): string
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function phpIniSizeToBytes(string $value): ?int
+{
+    $value = trim($value);
+    if ($value === '0' || $value === '-1') {
+        return null;
+    }
+    if (!preg_match('~^(\d+)\s*([KMG]?)$~i', $value, $match)) {
+        return null;
+    }
+    $multiplier = match (strtoupper($match[2])) {
+        'K' => 1024,
+        'M' => 1024 ** 2,
+        'G' => 1024 ** 3,
+        default => 1,
+    };
+    return (int) $match[1] * $multiplier;
+}
+
 function normalizeMetadataDate(string $value, ?string $timezoneOffset = null): ?string
 {
     $value = trim($value);
@@ -1361,7 +1379,12 @@ $formError = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $token = (string) ($_POST['csrf_token'] ?? '');
-    if (!hash_equals($_SESSION['csrf_token'], $token)) {
+    $postMaxSize = trim((string) ini_get('post_max_size'));
+    $postMaxBytes = phpIniSizeToBytes($postMaxSize);
+    $contentLength = filter_var($_SERVER['CONTENT_LENGTH'] ?? '', FILTER_VALIDATE_INT);
+    if ($postMaxBytes !== null && $contentLength !== false && $contentLength > $postMaxBytes) {
+        $formError = 'Przesyłane pliki przekraczają limit serwera (post_max_size: ' . $postMaxSize . '). Zmniejsz ich łączny rozmiar lub zwiększ post_max_size w konfiguracji PHP.';
+    } elseif (!hash_equals($_SESSION['csrf_token'], $token)) {
         $formError = 'Sesja formularza wygasła. Odśwież stronę i spróbuj ponownie.';
     } elseif (!isset($_FILES['files']) || !is_array($_FILES['files']['name'] ?? null)) {
         $formError = 'Wybierz co najmniej jeden plik do analizy.';

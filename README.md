@@ -24,7 +24,7 @@ php -S 127.0.0.1:8000
 
 Otwórz `http://127.0.0.1:8000`.
 
-Pliki są przetwarzane w katalogu tymczasowym PHP i nie są zapisywane w katalogu aplikacji. Limit wynosi 20 MB na plik i 10 plików na analizę. Porównanie ignoruje wielkość liter i nadmiarowe białe znaki. Szyfrowane PDF-y oraz wartości zapisane wyłącznie w niestandardowych rozszerzeniach mogą nie zostać odczytane. W konfiguracji PHP `upload_max_filesize` i `post_max_size` powinny wynosić co najmniej 20 MB.
+Pliki są przetwarzane w katalogu tymczasowym PHP i nie są zapisywane w katalogu aplikacji. Limit wynosi 20 MB na plik i 10 plików na analizę. Porównanie ignoruje wielkość liter i nadmiarowe białe znaki. Szyfrowane PDF-y oraz wartości zapisane wyłącznie w niestandardowych rozszerzeniach mogą nie zostać odczytane. W konfiguracji PHP `upload_max_filesize` powinno wynosić co najmniej 20 MB, a `post_max_size` co najmniej 210 MB, aby można było przesłać jednocześnie maksymalną liczbę plików o maksymalnym rozmiarze.
 
 Daty utworzenia i modyfikacji z PDF, Office i EXIF są wyświetlane jako `YYYY-MM-DD HH:mm` w języku przeglądarki. Gdy plik zawiera offset lub strefę czasową, godzina jest przeliczana do lokalnej strefy urządzenia przeglądającego. Daty bez informacji o strefie zachowują zapisany czas lokalny, ponieważ nie da się wiarygodnie ustalić ich offsetu.
 
