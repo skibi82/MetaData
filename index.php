@@ -14,7 +14,7 @@ $labels = [
     'subject' => 'Temat', 'keywords' => 'Słowa kluczowe',
     'description' => 'Opis', 'created' => 'Data utworzenia',
     'modified' => 'Data modyfikacji', 'last_modified_by' => 'Ostatnio zmodyfikował',
-    'revision_editing_time' => 'Liczba rewizji / czas edycji (cp:revision / TotalTime)',
+    'revision_editing_time' => 'Liczba rewizji / czas edycji',
     'last_printed' => 'Ostatni wydruk', 'identifier' => 'Identyfikator',
     'category' => 'Kategoria', 'content_status' => 'Status zawartości',
     'language' => 'Język', 'document_version' => 'Wersja dokumentu',
