@@ -3,7 +3,8 @@ declare(strict_types=1);
 
 session_start();
 
-const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const MAX_FILE_SIZE_MB = 128;
+const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 const MAX_FILES = 10;
 const POLISH_TSL_URL = 'https://www.nccert.pl/tsl/PL_TSL.xml';
 const POLISH_TSL_OPERATOR_FINGERPRINT = '446A041A550BC51B92525EF7E540090B2DF67F0852E5C7ADDB96661CCE330596';
@@ -1405,7 +1406,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     continue;
                 }
                 if ((int) $files['size'][$index] > MAX_FILE_SIZE) {
-                    $results[] = ['name' => $name, 'error' => 'Plik przekracza limit 20 MB.', 'metadata' => []];
+                    $results[] = ['name' => $name, 'error' => 'Plik przekracza limit ' . MAX_FILE_SIZE_MB . ' MB.', 'metadata' => []];
                     continue;
                 }
                 $inspection = inspectFile((string) $files['tmp_name'][$index], $name);
@@ -1471,7 +1472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <label class="dropzone" for="files">
                 <span class="upload-symbol" aria-hidden="true">+</span>
                 <span class="drop-copy"><strong>Wybierz pliki</strong><span>lub przeciągnij je tutaj</span></span>
-                <span class="drop-limit">Do 10 plików, maks. 20 MB każdy</span>
+                <span class="drop-limit">Do 10 plików, maks. <?= MAX_FILE_SIZE_MB ?> MB każdy</span>
                 <input id="files" name="files[]" type="file" multiple accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.tif,.tiff">
             </label>
             <div class="form-actions"><p id="file-summary" class="file-summary">Nie wybrano plików</p><button class="analyze-button" type="submit"><span>Sprawdź metadane</span><span aria-hidden="true">↗</span></button></div>
