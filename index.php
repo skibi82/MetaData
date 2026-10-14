@@ -14,7 +14,18 @@ $labels = [
     'subject' => 'Temat', 'keywords' => 'Słowa kluczowe',
     'description' => 'Opis', 'created' => 'Data utworzenia',
     'modified' => 'Data modyfikacji', 'last_modified_by' => 'Ostatnio zmodyfikował',
-    'editing_time' => 'Łączny czas edycji',
+    'revision_editing_time' => 'Liczba rewizji / czas edycji (cp:revision / TotalTime)',
+    'last_printed' => 'Ostatni wydruk', 'identifier' => 'Identyfikator',
+    'category' => 'Kategoria', 'content_status' => 'Status zawartości',
+    'language' => 'Język', 'document_version' => 'Wersja dokumentu',
+    'template' => 'Szablon', 'pages' => 'Liczba stron', 'words' => 'Liczba słów',
+    'characters' => 'Liczba znaków', 'lines' => 'Liczba wierszy', 'paragraphs' => 'Liczba akapitów',
+    'slides' => 'Liczba slajdów', 'notes' => 'Liczba notatek', 'hidden_slides' => 'Liczba ukrytych slajdów',
+    'mm_clips' => 'Liczba klipów multimedialnych', 'scale_crop' => 'Przycinanie do skali',
+    'links_up_to_date' => 'Aktualność łączy', 'shared_doc' => 'Dokument udostępniony',
+    'hyperlinks_changed' => 'Zmienione hiperłącza', 'app_version' => 'Wersja aplikacji',
+    'characters_with_spaces' => 'Liczba znaków ze spacjami', 'doc_security' => 'Ustawienia zabezpieczeń dokumentu',
+    'heading_pairs' => 'Grupy części dokumentu', 'titles_of_parts' => 'Tytuły części dokumentu',
     'software' => 'Program', 'producer' => 'Producent', 'manager' => 'Osoba kontaktowa',
     'copyright' => 'Prawa autorskie', 'camera' => 'Aparat', 'location' => 'Lokalizacja (GPS)',
 ];
@@ -119,7 +130,7 @@ function addMetadata(array &$metadata, string $key, mixed $value): void
         return;
     }
     $value = trim((string) $value);
-    if (in_array($key, ['created', 'modified'], true)) {
+    if (in_array($key, ['created', 'modified', 'last_printed'], true)) {
         $value = normalizeMetadataDate($value) ?? $value;
     }
     if ($value !== '') {
@@ -127,10 +138,58 @@ function addMetadata(array &$metadata, string $key, mixed $value): void
     }
 }
 
-function xmlProperty(SimpleXMLElement $xml, string $name): string
+function officeXmlElementValue(DOMElement $element): string
 {
-    $nodes = $xml->xpath('//*[local-name()="' . $name . '"]');
-    return $nodes ? trim((string) $nodes[0]) : '';
+    $values = [];
+    foreach ($element->childNodes as $child) {
+        if ($child instanceof DOMText || $child instanceof DOMCdataSection) {
+            $value = trim($child->nodeValue ?? '');
+        } elseif ($child instanceof DOMElement) {
+            $value = officeXmlElementValue($child);
+        } else {
+            continue;
+        }
+        if ($value !== '') {
+            $values[] = $value;
+        }
+    }
+    return implode(', ', $values);
+}
+
+function readOfficeXmlProperties(ZipArchive $archive, string $entry, bool $custom = false): array
+{
+    $contents = $archive->getFromName($entry);
+    if (!is_string($contents)) {
+        return [];
+    }
+    $document = new DOMDocument();
+    if (!@$document->loadXML($contents, LIBXML_NONET | LIBXML_NOBLANKS) || !$document->documentElement instanceof DOMElement) {
+        return [];
+    }
+    $properties = [];
+    foreach ($document->documentElement->childNodes as $node) {
+        if (!$node instanceof DOMElement) {
+            continue;
+        }
+        $name = $custom ? trim($node->getAttribute('name')) : $node->localName;
+        if ($name !== '') {
+            $properties[$name] = officeXmlElementValue($node);
+        }
+    }
+    return $properties;
+}
+
+function officeMetadataLabel(string $key, array $labels): string
+{
+    if (isset($labels[$key])) {
+        return $labels[$key];
+    }
+    foreach (['office_core:' => 'Office core: ', 'office_app:' => 'Office app: ', 'office_custom:' => 'Właściwość niestandardowa: '] as $prefix => $label) {
+        if (str_starts_with($key, $prefix)) {
+            return $label . substr($key, strlen($prefix));
+        }
+    }
+    return $key;
 }
 
 function formatEditingTime(string $value): string
@@ -165,33 +224,47 @@ function extractOfficeMetadata(string $path): array
     }
 
     $metadata = [];
-    $parts = [
-        'docProps/core.xml' => [
-            'creator' => 'author', 'lastModifiedBy' => 'last_modified_by',
-            'title' => 'title', 'subject' => 'subject', 'keywords' => 'keywords',
-            'description' => 'description', 'created' => 'created', 'modified' => 'modified',
-        ],
-        'docProps/app.xml' => [
-            'Company' => 'company', 'Manager' => 'manager', 'Application' => 'software',
-            'TotalTime' => 'editing_time',
-        ],
+    $coreProperties = readOfficeXmlProperties($archive, 'docProps/core.xml');
+    $appProperties = readOfficeXmlProperties($archive, 'docProps/app.xml');
+    $customProperties = readOfficeXmlProperties($archive, 'docProps/custom.xml', true);
+    $coreMapping = [
+        'creator' => 'author', 'lastModifiedBy' => 'last_modified_by', 'title' => 'title',
+        'subject' => 'subject', 'keywords' => 'keywords', 'description' => 'description',
+        'created' => 'created', 'modified' => 'modified', 'lastPrinted' => 'last_printed',
+        'identifier' => 'identifier', 'category' => 'category', 'contentStatus' => 'content_status',
+        'language' => 'language', 'version' => 'document_version',
     ];
-    foreach ($parts as $entry => $properties) {
-        $contents = $archive->getFromName($entry);
-        if ($contents === false) {
+    $appMapping = [
+        'Company' => 'company', 'Manager' => 'manager', 'Application' => 'software',
+        'Template' => 'template', 'Pages' => 'pages', 'Words' => 'words',
+        'Characters' => 'characters', 'Lines' => 'lines', 'Paragraphs' => 'paragraphs',
+        'Slides' => 'slides', 'Notes' => 'notes', 'HiddenSlides' => 'hidden_slides',
+        'MMClips' => 'mm_clips', 'ScaleCrop' => 'scale_crop', 'LinksUpToDate' => 'links_up_to_date',
+        'SharedDoc' => 'shared_doc', 'HyperlinksChanged' => 'hyperlinks_changed',
+        'AppVersion' => 'app_version', 'CharactersWithSpaces' => 'characters_with_spaces',
+        'DocSecurity' => 'doc_security', 'HeadingPairs' => 'heading_pairs', 'TitlesOfParts' => 'titles_of_parts',
+    ];
+    foreach ($coreProperties as $property => $value) {
+        if ($property === 'revision') {
             continue;
         }
-        $xml = @simplexml_load_string($contents, SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOBLANKS);
-        if ($xml === false) {
+        addMetadata($metadata, $coreMapping[$property] ?? 'office_core:' . $property, $value);
+    }
+    foreach ($appProperties as $property => $value) {
+        if ($property === 'TotalTime') {
             continue;
         }
-        foreach ($properties as $property => $key) {
-            $value = xmlProperty($xml, $property);
-            if ($key === 'editing_time') {
-                $value = formatEditingTime($value);
-            }
-            addMetadata($metadata, $key, $value);
-        }
+        addMetadata($metadata, $appMapping[$property] ?? 'office_app:' . $property, $value);
+    }
+    foreach ($customProperties as $property => $value) {
+        addMetadata($metadata, 'office_custom:' . $property, $value);
+    }
+    $revision = trim($coreProperties['revision'] ?? '');
+    $totalTime = trim($appProperties['TotalTime'] ?? '');
+    if ($revision !== '' || $totalTime !== '') {
+        $revisionValue = $revision !== '' ? $revision : 'brak danych';
+        $timeValue = $totalTime !== '' ? formatEditingTime($totalTime) : 'brak danych';
+        addMetadata($metadata, 'revision_editing_time', $revisionValue . ' / ' . $timeValue);
     }
     $signatureFound = false;
     for ($index = 0; $index < $archive->numFiles; $index++) {
@@ -1484,7 +1557,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="file-heading"><span class="file-type" aria-hidden="true"><?= escape(strtoupper(pathinfo($result['name'], PATHINFO_EXTENSION))) ?></span><div class="file-name-wrap"><h3><?= escape($result['name']) ?></h3><p><?= $result['error'] !== '' ? 'Nie udało się odczytać' : count($result['metadata']) . ' odczytanych pól' ?></p></div><span class="file-state <?= $result['error'] !== '' ? 'state-error' : '' ?>" aria-label="<?= $result['error'] !== '' ? 'Błąd' : 'Przeanalizowano' ?>"></span></div>
                             <?php if ($result['error'] !== ''): ?><p class="file-error"><?= escape($result['error']) ?></p>
                             <?php elseif ($result['metadata'] === []): ?><p class="empty-metadata">Ten plik nie zawiera odczytywalnych metadanych.</p>
-                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape($labels[$key] ?? $key) ?></dt><dd><?php if (in_array($key, ['created', 'modified'], true) && preg_match('~^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$~', $value)): ?><time class="metadata-date" datetime="<?= escape($value) ?>"><?= escape($value) ?></time><?php elseif ($key === 'location'): ?><?= escape($value) ?> · <a href="https://www.google.com/maps?q=<?= rawurlencode($value) ?>" rel="noopener noreferrer" target="_blank">Otwórz w Google Maps</a><?php else: ?><?= escape($value) ?><?php endif; ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
+                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape(officeMetadataLabel($key, $labels)) ?></dt><dd><?php if (in_array($key, ['created', 'modified', 'last_printed'], true) && preg_match('~^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$~', $value)): ?><time class="metadata-date" datetime="<?= escape($value) ?>"><?= escape($value) ?></time><?php elseif ($key === 'location'): ?><?= escape($value) ?> · <a href="https://www.google.com/maps?q=<?= rawurlencode($value) ?>" rel="noopener noreferrer" target="_blank">Otwórz w Google Maps</a><?php else: ?><?= escape($value) ?><?php endif; ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
                             <?php if (is_array($result['signatures'])): ?>
                                 <div class="signature-report">
                                     <div class="signature-heading"><strong>Podpis cyfrowy</strong><span class="signature-status status-<?= escape($result['signatures']['status']) ?>"><?= escape($result['signatures']['summary']) ?></span></div>
@@ -1539,7 +1612,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <div class="match-files"><span><?= escape($results[$comparison['left']]['name']) ?></span><span class="match-arrow" aria-hidden="true">↔</span><span><?= escape($results[$comparison['right']]['name']) ?></span></div>
                                 <div class="match-values">
                                     <?php foreach ($comparison['matches'] as $key => $value): ?>
-                                        <span class="match-chip <?= in_array($key, ['author', 'company'], true) ? 'match-important' : '' ?>"><b><?= escape($labels[$key] ?? $key) ?>:</b> <?= escape($value) ?></span>
+                                        <span class="match-chip <?= in_array($key, ['author', 'company'], true) ? 'match-important' : '' ?>"><b><?= escape(officeMetadataLabel($key, $labels)) ?>:</b> <?= escape($value) ?></span>
                                     <?php endforeach; ?>
                                 </div>
                             </div>
