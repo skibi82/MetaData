@@ -1020,9 +1020,11 @@ function validateCertificateChain(string $certificate, array $embeddedCertificat
         ];
     }
     if (!$qualifiedAuthority) {
+        $authorityInfo = @openssl_x509_parse($authority);
+        $authorityName = (string) (($authorityInfo['subject']['CN'] ?? null) ?: ($authorityInfo['subject']['O'] ?? 'nieznany wystawca'));
         return [
             'status' => 'not_qualified',
-            'message' => 'Ścieżka dochodzi do korzenia TSL, ale wystawca podpisującego nie ma aktywnego wpisu CA/QC.',
+            'message' => 'Wystawca „' . $authorityName . '” nie figuruje w aktualnej TSL jako aktywny CA/QC. Nie oznacza to samo w sobie błędu integralności podpisu; bez zaufanego znacznika czasu i historycznej TSL nie można potwierdzić jego statusu kwalifikowanego w chwili podpisu.',
             'certificates' => $certificateStatuses,
         ];
     }
