@@ -929,13 +929,8 @@ function certificateRevocationStatus(string $certificate, array $embeddedCertifi
 function validateCertificateChain(string $certificate, array $embeddedCertificates): array
 {
     $trustedList = loadPolishTrustedList();
-    if (!is_array($trustedList)) {
-        return [
-            'status' => 'unknown',
-            'message' => 'Nie udało się zweryfikować podpisanej polskiej listy TSL.',
-            'certificates' => [],
-        ];
-    }
+    $trustedListAvailable = is_array($trustedList);
+    $trustedList ??= ['roots' => [], 'qualified_authorities' => []];
     $certificatePool = array_merge($embeddedCertificates, array_values($trustedList['roots']));
     $chain = [];
     $seenFingerprints = [];
@@ -959,18 +954,43 @@ function validateCertificateChain(string $certificate, array $embeddedCertificat
         $certificatePool[] = $issuerCertificate;
         $current = $issuerCertificate;
     }
+    $certificateStatuses = [];
+    $hasUnknownRevocation = false;
+    $hasRevokedCertificate = false;
+    $now = time();
+    foreach ($chain as $index => $chainCertificate) {
+        $parsed = @openssl_x509_parse($chainCertificate);
+        $validFrom = (int) ($parsed['validFrom_time_t'] ?? 0);
+        $validTo = (int) ($parsed['validTo_time_t'] ?? 0);
+        $hasValidityPeriod = $validFrom > 0 && $validTo > 0;
+        $currentlyValid = $hasValidityPeriod && $validFrom <= $now && $validTo >= $now;
+        $validityStatus = !$hasValidityPeriod
+            ? 'unknown'
+            : ($validFrom > $now ? 'not_yet_valid' : ($validTo < $now ? 'expired' : 'valid'));
+        $isRoot = is_string($rootCertificate) && $index === count($chain) - 1;
+        $revocation = $isRoot
+            ? ['status' => 'good', 'message' => 'Korzeń znajduje się na aktualnej polskiej TSL.', 'source' => POLISH_TSL_URL]
+            : certificateRevocationStatus($chainCertificate, $chain);
+        $hasUnknownRevocation = $hasUnknownRevocation || $revocation['status'] === 'unknown';
+        $hasRevokedCertificate = $hasRevokedCertificate || $revocation['status'] === 'revoked';
+        $certificateStatuses[] = [
+            'name' => (string) (($parsed['subject']['CN'] ?? null) ?: ($parsed['subject']['O'] ?? 'Certyfikat')),
+            'role' => $index === 0 ? 'Podpisujący' : ($isRoot ? 'Korzeń' : 'Urząd pośredni'),
+            'fingerprint' => strtoupper((string) openssl_x509_fingerprint($chainCertificate, 'sha256')),
+            'valid_from' => $validFrom > 0 ? gmdate('Y-m-d H:i:s', $validFrom) . ' UTC' : 'Nieznana',
+            'valid_to' => $validTo > 0 ? gmdate('Y-m-d H:i:s', $validTo) . ' UTC' : 'Nieznana',
+            'validity_status' => $validityStatus,
+            'currently_valid' => $currentlyValid,
+            'revocation' => $revocation,
+        ];
+    }
     if (!is_string($rootCertificate)) {
         return [
             'status' => 'unknown',
-            'message' => 'Nie udało się zbudować łańcucha do aktywnego korzenia z polskiej TSL.',
-            'certificates' => array_map(static function (string $chainCertificate, int $index) use ($chain): array {
-                $parsed = @openssl_x509_parse($chainCertificate);
-                return [
-                    'name' => (string) (($parsed['subject']['CN'] ?? null) ?: ($parsed['subject']['O'] ?? 'Certyfikat')),
-                    'role' => $index === 0 ? 'Podpisujący' : 'Urząd pośredni',
-                    'fingerprint' => strtoupper((string) openssl_x509_fingerprint($chainCertificate, 'sha256')),
-                ];
-            }, $chain, array_keys($chain)),
+            'message' => $trustedListAvailable
+                ? 'Nie udało się zbudować łańcucha do aktywnego korzenia z polskiej TSL.'
+                : 'Nie udało się zweryfikować podpisanej polskiej TSL ani potwierdzić korzenia łańcucha.',
+            'certificates' => $certificateStatuses,
         ];
     }
     $rootFingerprint = strtoupper((string) openssl_x509_fingerprint($rootCertificate, 'sha256'));
@@ -996,55 +1016,31 @@ function validateCertificateChain(string $certificate, array $embeddedCertificat
     @unlink($rootPath);
     @unlink($intermediatesPath);
     if (!$pathTrusted) {
-        return ['status' => 'invalid', 'message' => 'OpenSSL odrzucił łańcuch certyfikatów (podpis, ważność lub ograniczenia CA).', 'certificates' => []];
+        return ['status' => 'invalid', 'message' => 'OpenSSL odrzucił łańcuch certyfikatów (podpis, ważność lub ograniczenia CA).', 'certificates' => $certificateStatuses];
     }
     $authority = $chain[1] ?? $rootCertificate;
     $authorityFingerprint = strtoupper((string) openssl_x509_fingerprint($authority, 'sha256'));
     $qualifiedAuthority = isset($trustedList['qualified_authorities'][$authorityFingerprint]);
-    $certificateStatuses = [];
-    $hasUnknownRevocation = false;
-    $hasRevokedCertificate = false;
-    foreach ($chain as $index => $chainCertificate) {
-        $parsed = @openssl_x509_parse($chainCertificate);
-        $isRoot = $index === count($chain) - 1;
-        $revocation = $isRoot
-            ? ['status' => 'good', 'message' => 'Korzeń znajduje się na aktualnej polskiej TSL.', 'source' => POLISH_TSL_URL]
-            : certificateRevocationStatus($chainCertificate, $chain);
-        $hasUnknownRevocation = $hasUnknownRevocation || $revocation['status'] === 'unknown';
-        $hasRevokedCertificate = $hasRevokedCertificate || $revocation['status'] === 'revoked';
-        $certificateStatuses[] = [
-            'name' => (string) (($parsed['subject']['CN'] ?? null) ?: ($parsed['subject']['O'] ?? 'Certyfikat')),
-            'role' => $index === 0 ? 'Podpisujący' : ($isRoot ? 'Korzeń' : 'Sub-CA'),
-            'fingerprint' => strtoupper((string) openssl_x509_fingerprint($chainCertificate, 'sha256')),
-            'revocation' => $revocation,
-        ];
-    }
-    if (!$qualifiedAuthority) {
-        $authorityInfo = @openssl_x509_parse($authority);
-        $authorityName = (string) (($authorityInfo['subject']['CN'] ?? null) ?: ($authorityInfo['subject']['O'] ?? 'nieznany wystawca'));
-        return [
-            'status' => 'not_qualified',
-            'message' => 'Wystawca „' . $authorityName . '” nie figuruje w aktualnej TSL jako aktywny CA/QC. Nie oznacza to samo w sobie błędu integralności podpisu; bez zaufanego znacznika czasu i historycznej TSL nie można potwierdzić jego statusu kwalifikowanego w chwili podpisu.',
-            'certificates' => $certificateStatuses,
-        ];
-    }
+    $qualificationNote = $qualifiedAuthority
+        ? ' Wystawca ma aktywny wpis CA/QC w TSL.'
+        : ' Brak aktywnego wpisu CA/QC w bieżącej TSL dotyczy kwalifikacji podpisu, nie poprawności łańcucha.';
     if ($hasRevokedCertificate) {
         return [
             'status' => 'revoked',
-            'message' => 'Co najmniej jeden certyfikat w łańcuchu figuruje na aktualnej CRL.',
+            'message' => 'Co najmniej jeden certyfikat w łańcuchu figuruje na aktualnej CRL.' . $qualificationNote,
             'certificates' => $certificateStatuses,
         ];
     }
     if ($hasUnknownRevocation) {
         return [
             'status' => 'unknown',
-            'message' => 'Łańcuch jest poprawny, ale nie udało się zweryfikować CRL dla każdego certyfikatu.',
+            'message' => 'Ścieżka certyfikacji prowadzi do zaufanego korzenia, ale nie udało się zweryfikować CRL dla każdego certyfikatu.' . $qualificationNote,
             'certificates' => $certificateStatuses,
         ];
     }
     return [
         'status' => 'valid',
-        'message' => 'Pełny łańcuch prowadzi do aktywnego korzenia NCCert; wystawca ma status CA/QC w TSL, a CRL są aktualne.',
+        'message' => 'Certyfikat jest ważny i zaufany w ramach tej weryfikacji: pełny łańcuch prowadzi do aktywnego korzenia NCCert, certyfikaty są ważne i nie figurują na aktualnych CRL.' . $qualificationNote,
         'certificates' => $certificateStatuses,
     ];
 }
@@ -1501,9 +1497,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                                     <div><dt>Podpisujący</dt><dd><?= escape($certificate['name']) ?></dd></div>
                                                     <div><dt>Wystawca</dt><dd><?= escape($certificate['issuer']) ?></dd></div>
                                                     <div><dt>Ważność</dt><dd><?= escape($certificate['valid_from']) ?> – <?= escape($certificate['valid_to']) ?> · <?= $certificate['currently_valid'] ? 'ważny obecnie' : 'poza okresem ważności' ?></dd></div>
-                                                    <div><dt>Zaufanie lokalne</dt><dd><?= $certificate['trusted'] ? 'certyfikat zaufany przez lokalny magazyn OpenSSL' : 'certyfikat niezaufany lub niezweryfikowany przez lokalny magazyn OpenSSL' ?></dd></div>
+                                                    <div><dt>Magazyn OpenSSL systemu</dt><dd><?= $certificate['trusted'] ? 'certyfikat zaufany przez lokalny magazyn OpenSSL' : 'certyfikat niezaufany lub niezweryfikowany przez lokalny magazyn OpenSSL' ?></dd></div>
                                                     <div><dt>Status CRL</dt><dd><?= escape($certificate['revocation']['message']) ?><?php if ($certificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($certificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło CRL</a><?php endif; ?></dd></div>
-                                                    <?php if (isset($certificate['chain'])): ?><div><dt>Łańcuch zaufania</dt><dd><strong class="chain-status-<?= escape($certificate['chain']['status']) ?>"><?= escape($certificate['chain']['message']) ?></strong><?php if ($certificate['chain']['certificates'] !== []): ?><ol class="certificate-chain-path"><?php foreach ($certificate['chain']['certificates'] as $chainCertificate): ?><li><?= escape($chainCertificate['role']) ?>: <?= escape($chainCertificate['name']) ?><?php if (isset($chainCertificate['revocation'])): ?> · <?= escape($chainCertificate['revocation']['message']) ?><?php if ($chainCertificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($chainCertificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło</a><?php endif; ?><?php endif; ?></li><?php endforeach; ?></ol><?php endif; ?></dd></div><?php endif; ?>
+                                                    <?php if (isset($certificate['chain'])): ?>
+                                                        <div>
+                                                            <dt>Łańcuch zaufania</dt>
+                                                            <dd>
+                                                                <strong class="chain-status-<?= escape($certificate['chain']['status']) ?>"><?= escape($certificate['chain']['message']) ?></strong>
+                                                                <?php if ($certificate['chain']['certificates'] !== []): ?>
+                                                                    <ol class="certificate-chain-path">
+                                                                        <?php foreach ($certificate['chain']['certificates'] as $chainCertificate): ?>
+                                                                            <li class="chain-certificate">
+                                                                                <strong><?= escape($chainCertificate['role']) ?>: <?= escape($chainCertificate['name']) ?></strong>
+                                                                                <span>Ważność: <?= escape($chainCertificate['valid_from']) ?> – <?= escape($chainCertificate['valid_to']) ?></span>
+                                                                                <span class="chain-validity-<?= escape($chainCertificate['validity_status']) ?>">Status ważności: <?= match ($chainCertificate['validity_status']) { 'valid' => 'ważny obecnie', 'expired' => 'wygasł', 'not_yet_valid' => 'jeszcze nieważny', default => 'nieznany' } ?></span>
+                                                                                <span class="chain-revocation-<?= escape($chainCertificate['revocation']['status']) ?>">CRL: <?= escape($chainCertificate['revocation']['message']) ?><?php if ($chainCertificate['revocation']['source'] !== ''): ?> · <a href="<?= escape($chainCertificate['revocation']['source']) ?>" rel="noopener noreferrer" target="_blank">źródło</a><?php endif; ?></span>
+                                                                                <small>SHA-256: <?= escape($chainCertificate['fingerprint']) ?></small>
+                                                                            </li>
+                                                                        <?php endforeach; ?>
+                                                                    </ol>
+                                                                <?php endif; ?>
+                                                            </dd>
+                                                        </div>
+                                                    <?php endif; ?>
                                                     <div><dt>SHA-256</dt><dd><?= escape($certificate['fingerprint']) ?></dd></div>
                                                 </dl>
                                             <?php endforeach; ?>
