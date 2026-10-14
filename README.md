@@ -9,7 +9,7 @@ git config core.hooksPath .githooks
 ```
 
 - PDF: podstawowe pola słownika informacji, takie jak autor, tytuł, temat, program i daty.
-- DOCX, XLSX, PPTX: właściwości standardowe i niestandardowe z Open XML, w tym `cp:revision` / `TotalTime`, `cp:lastPrinted`, identyfikatory oraz pola ukryte w `docProps`. Stare binarne formaty DOC i XLS nie są obsługiwane.
+- DOCX, XLSX, PPTX: właściwości standardowe i niestandardowe z Open XML, w tym `cp:revision` / `TotalTime`, `cp:lastPrinted`, identyfikatory oraz pola ukryte w `docProps`. Dla XLSX odczytywane są również `x15ac:absPath`, `ICV` i `KSOProductBuildVer`. Stare binarne formaty DOC i XLS nie są obsługiwane.
 - JPG, TIFF: dostępne dane EXIF, między innymi autor, opis, daty, aparat, prawa autorskie i lokalizacja GPS z linkiem do Google Maps.
 - PDF: wykrywanie podpisów CMS, weryfikacja integralności zakresu `ByteRange`, odczyt certyfikatu podpisującego i online sprawdzanie jego statusu na CRL wskazanym w certyfikacie.
 - Office Open XML: wykrywanie podpisu XMLDSIG; jego weryfikacja kryptograficzna nie jest jeszcze obsługiwana.

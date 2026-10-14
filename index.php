@@ -16,6 +16,8 @@ $labels = [
     'modified' => 'Data modyfikacji', 'last_modified_by' => 'Ostatnio zmodyfikował',
     'revision_editing_time' => 'Liczba rewizji / czas edycji',
     'last_printed' => 'Ostatni wydruk', 'identifier' => 'Identyfikator',
+    'xlsx_absolute_path' => 'Zapisana ścieżka lokalna (x15ac:absPath)',
+    'excel_icv' => 'ICV (custom.xml)', 'kso_product_build_ver' => 'KSOProductBuildVer (custom.xml)',
     'category' => 'Kategoria', 'content_status' => 'Status zawartości',
     'language' => 'Język', 'document_version' => 'Wersja dokumentu',
     'template' => 'Szablon', 'pages' => 'Liczba stron', 'words' => 'Liczba słów',
@@ -213,7 +215,7 @@ function formatEditingTime(string $value): string
     return $duration . ' (' . $minutes . ' min)';
 }
 
-function extractOfficeMetadata(string $path): array
+function extractOfficeMetadata(string $path, bool $isXlsx = false): array
 {
     if (!class_exists(ZipArchive::class)) {
         return ['error' => 'Odczyt plików Office wymaga rozszerzenia PHP ZipArchive.'];
@@ -257,7 +259,28 @@ function extractOfficeMetadata(string $path): array
         addMetadata($metadata, $appMapping[$property] ?? 'office_app:' . $property, $value);
     }
     foreach ($customProperties as $property => $value) {
-        addMetadata($metadata, 'office_custom:' . $property, $value);
+        $customKey = match ($property) {
+            'ICV' => 'excel_icv',
+            'KSOProductBuildVer' => 'kso_product_build_ver',
+            default => 'office_custom:' . $property,
+        };
+        addMetadata($metadata, $customKey, $value);
+    }
+    if ($isXlsx) {
+        $workbookContents = $archive->getFromName('xl/workbook.xml');
+        if (is_string($workbookContents)) {
+            $workbook = new DOMDocument();
+            if (@$workbook->loadXML($workbookContents, LIBXML_NONET | LIBXML_NOBLANKS)) {
+                $xpath = new DOMXPath($workbook);
+                $absolutePaths = $xpath->query('//*[local-name()="absPath" and namespace-uri()="http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac"]');
+                foreach ($absolutePaths ?: [] as $absolutePath) {
+                    if ($absolutePath instanceof DOMElement) {
+                        $pathValue = trim($absolutePath->getAttribute('url'));
+                        addMetadata($metadata, 'xlsx_absolute_path', $pathValue !== '' ? $pathValue : $absolutePath->textContent);
+                    }
+                }
+            }
+        }
     }
     $revision = trim($coreProperties['revision'] ?? '');
     $totalTime = trim($appProperties['TotalTime'] ?? '');
@@ -1434,7 +1457,7 @@ function inspectFile(string $path, string $name): array
         return extractPdfMetadata($path);
     }
     if (in_array($extension, ['docx', 'xlsx', 'pptx'], true)) {
-        return extractOfficeMetadata($path);
+        return extractOfficeMetadata($path, $extension === 'xlsx');
     }
     return ['error' => 'Nieobsługiwany format. Wybierz PDF, DOCX, XLSX, PPTX, JPG lub TIFF.'];
 }
