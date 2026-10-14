@@ -15,7 +15,7 @@ $labels = [
     'modified' => 'Data modyfikacji', 'last_modified_by' => 'Ostatnio zmodyfikował',
     'editing_time' => 'Łączny czas edycji',
     'software' => 'Program', 'producer' => 'Producent', 'manager' => 'Osoba kontaktowa',
-    'copyright' => 'Prawa autorskie', 'camera' => 'Aparat',
+    'copyright' => 'Prawa autorskie', 'camera' => 'Aparat', 'location' => 'Lokalizacja (GPS)',
 ];
 $version = trim((string) (@file_get_contents(__DIR__ . '/VERSION') ?: '0.001'));
 
@@ -1266,6 +1266,49 @@ function flattenExif(array $data, array &$metadata): void
     }
 }
 
+function exifRationalToFloat(mixed $value): ?float
+{
+    if (!is_scalar($value)) {
+        return null;
+    }
+    $value = trim((string) $value);
+    if (preg_match('~^(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)$~', $value, $match)) {
+        $denominator = (float) $match[2];
+        if ($denominator === 0.0) {
+            return null;
+        }
+        $number = (float) $match[1] / $denominator;
+    } elseif (is_numeric($value)) {
+        $number = (float) $value;
+    } else {
+        return null;
+    }
+    return is_finite($number) ? $number : null;
+}
+
+function exifGpsCoordinate(mixed $values, mixed $reference, string $positiveReference, string $negativeReference, float $maximum): ?float
+{
+    if (!is_array($values) || count($values) < 3 || !is_scalar($reference)) {
+        return null;
+    }
+    $values = array_values($values);
+    $degrees = exifRationalToFloat($values[0]);
+    $minutes = exifRationalToFloat($values[1]);
+    $seconds = exifRationalToFloat($values[2]);
+    $reference = strtoupper(trim((string) $reference));
+    if ($degrees === null || $minutes === null || $seconds === null
+        || $minutes < 0 || $minutes >= 60 || $seconds < 0 || $seconds >= 60
+        || abs($degrees) > $maximum
+        || !in_array($reference, [$positiveReference, $negativeReference], true)) {
+        return null;
+    }
+    $coordinate = abs($degrees) + $minutes / 60 + $seconds / 3600;
+    if ($coordinate > $maximum) {
+        return null;
+    }
+    return $reference === $negativeReference ? -$coordinate : $coordinate;
+}
+
 function extractImageMetadata(string $path): array
 {
     if (!function_exists('exif_read_data')) {
@@ -1275,6 +1318,14 @@ function extractImageMetadata(string $path): array
     $exif = @exif_read_data($path, null, true);
     if (is_array($exif)) {
         flattenExif($exif, $metadata);
+        $gps = $exif['GPS'] ?? [];
+        if (is_array($gps)) {
+            $latitude = exifGpsCoordinate($gps['GPSLatitude'] ?? null, $gps['GPSLatitudeRef'] ?? null, 'N', 'S', 90);
+            $longitude = exifGpsCoordinate($gps['GPSLongitude'] ?? null, $gps['GPSLongitudeRef'] ?? null, 'E', 'W', 180);
+            if ($latitude !== null && $longitude !== null) {
+                $metadata['location'] = number_format($latitude, 6, '.', '') . ', ' . number_format($longitude, 6, '.', '');
+            }
+        }
     }
     return ['metadata' => $metadata];
 }
@@ -1411,7 +1462,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="file-heading"><span class="file-type" aria-hidden="true"><?= escape(strtoupper(pathinfo($result['name'], PATHINFO_EXTENSION))) ?></span><div class="file-name-wrap"><h3><?= escape($result['name']) ?></h3><p><?= $result['error'] !== '' ? 'Nie udało się odczytać' : count($result['metadata']) . ' odczytanych pól' ?></p></div><span class="file-state <?= $result['error'] !== '' ? 'state-error' : '' ?>" aria-label="<?= $result['error'] !== '' ? 'Błąd' : 'Przeanalizowano' ?>"></span></div>
                             <?php if ($result['error'] !== ''): ?><p class="file-error"><?= escape($result['error']) ?></p>
                             <?php elseif ($result['metadata'] === []): ?><p class="empty-metadata">Ten plik nie zawiera odczytywalnych metadanych.</p>
-                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape($labels[$key] ?? $key) ?></dt><dd><?php if (in_array($key, ['created', 'modified'], true) && preg_match('~^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$~', $value)): ?><time class="metadata-date" datetime="<?= escape($value) ?>"><?= escape($value) ?></time><?php else: ?><?= escape($value) ?><?php endif; ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
+                            <?php else: ?><dl class="metadata-list"><?php foreach ($result['metadata'] as $key => $value): ?><div><dt><?= escape($labels[$key] ?? $key) ?></dt><dd><?php if (in_array($key, ['created', 'modified'], true) && preg_match('~^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?$~', $value)): ?><time class="metadata-date" datetime="<?= escape($value) ?>"><?= escape($value) ?></time><?php elseif ($key === 'location'): ?><?= escape($value) ?> · <a href="https://www.google.com/maps?q=<?= rawurlencode($value) ?>" rel="noopener noreferrer" target="_blank">Otwórz w Google Maps</a><?php else: ?><?= escape($value) ?><?php endif; ?></dd></div><?php endforeach; ?></dl><?php endif; ?>
                             <?php if (is_array($result['signatures'])): ?>
                                 <div class="signature-report">
                                     <div class="signature-heading"><strong>Podpis cyfrowy</strong><span class="signature-status status-<?= escape($result['signatures']['status']) ?>"><?= escape($result['signatures']['summary']) ?></span></div>
